@@ -3,7 +3,8 @@
 This enhanced version is still small enough for a course project, but it is no
 longer a static one-step DAG toy problem. Each episode samples a new dependency
 DAG, modules can take multiple timesteps, robots have heterogeneous speed
-profiles, and a shared crane has a short cooldown after task dispatch.
+profiles, spatial travel costs, and a shared crane has a short cooldown after
+task dispatch.
 """
 
 from __future__ import annotations
@@ -28,33 +29,37 @@ class StepStats:
     resource_conflicts: int = 0
     invalid_completed: int = 0
     busy_action_violations: int = 0
+    travel_distance: float = 0.0
 
 
 class ConstructionSchedulingEnv:
     """CTDE-friendly cooperative construction scheduling task.
 
     Main mechanics:
-    - N x M grid, one module per cell.
+    - N x M grid, one module per cell. The project default is now 10 x 10.
     - A fresh random DAG is generated each episode.
     - Some modules are heavy and require two robots to start.
     - Normal and heavy modules take multiple timesteps to finish.
     - Robots have heterogeneous normal/heavy task duration multipliers.
+    - Robots start from site boundary/corner points and pay travel time to modules.
     - The shared crane can dispatch at most one new task, then enters cooldown.
     - Rewards are team-shared.
     """
 
     def __init__(
         self,
-        grid_shape: Tuple[int, int] = (4, 4),
-        num_robots: int = 3,
+        grid_shape: Tuple[int, int] = (10, 10),
+        num_robots: int = 6,
         heavy_ratio: float = 0.25,
-        max_steps: int = 100,
-        dependency_prob: float = 0.22,
+        max_steps: int = 900,
+        dependency_prob: float = 0.08,
         max_prerequisites: int = 2,
         normal_base_duration: int = 2,
         heavy_base_duration: int = 4,
         delay_probability: float = 0.25,
         crane_cooldown_steps: int = 1,
+        travel_speed_cells_per_step: float = 3.0,
+        travel_reward_weight: float = 0.01,
         seed: int | None = None,
     ) -> None:
         self.grid_shape = grid_shape
@@ -67,6 +72,8 @@ class ConstructionSchedulingEnv:
         self.heavy_base_duration = heavy_base_duration
         self.delay_probability = delay_probability
         self.crane_cooldown_steps = crane_cooldown_steps
+        self.travel_speed_cells_per_step = travel_speed_cells_per_step
+        self.travel_reward_weight = travel_reward_weight
         self.rng = np.random.default_rng(seed)
 
         self.num_modules = int(grid_shape[0] * grid_shape[1])
@@ -74,6 +81,10 @@ class ConstructionSchedulingEnv:
         self.action_size = self.num_modules + 1
 
         self.robot_capabilities = self._build_robot_capabilities()
+        self.module_positions = self._build_module_positions()
+        self.robot_start_positions = self._build_robot_start_positions()
+        self.robot_positions = self.robot_start_positions.copy()
+        self.max_travel_distance = float(max(1.0, sum(self.grid_shape)))
         self.dependencies: List[List[int]] = [[] for _ in range(self.num_modules)]
         self.completed = np.zeros(self.num_modules, dtype=np.float32)
         self.in_progress = np.zeros(self.num_modules, dtype=np.float32)
@@ -102,6 +113,8 @@ class ConstructionSchedulingEnv:
                 [1.00, 0.75],
                 [1.20, 1.00],
                 [0.90, 1.10],
+                [1.10, 0.85],
+                [0.85, 1.15],
             ],
             dtype=np.float32,
         )
@@ -109,6 +122,50 @@ class ConstructionSchedulingEnv:
             return templates[: self.num_robots].copy()
         extra = np.ones((self.num_robots - len(templates), 2), dtype=np.float32)
         return np.vstack([templates, extra])
+
+    def _build_module_positions(self) -> np.ndarray:
+        """Module target positions are grid-cell centers."""
+
+        rows, cols = self.grid_shape
+        positions = np.zeros((self.num_modules, 2), dtype=np.float32)
+        for module in range(self.num_modules):
+            row, col = divmod(module, cols)
+            positions[module] = np.array([row + 0.5, col + 0.5], dtype=np.float32)
+        return positions
+
+    def _build_robot_start_positions(self) -> np.ndarray:
+        """Place robots on grid boundary points, starting from the four corners."""
+
+        rows, cols = self.grid_shape
+        anchors = [
+            (0.0, 0.0),
+            (0.0, float(cols)),
+            (float(rows), 0.0),
+            (float(rows), float(cols)),
+            (0.0, float(cols) / 2.0),
+            (float(rows), float(cols) / 2.0),
+            (float(rows) / 2.0, 0.0),
+            (float(rows) / 2.0, float(cols)),
+        ]
+        if self.num_robots <= len(anchors):
+            return np.asarray(anchors[: self.num_robots], dtype=np.float32)
+
+        positions = list(anchors)
+        for idx in range(self.num_robots - len(anchors)):
+            frac = (idx + 1) / float(self.num_robots - len(anchors) + 1)
+            positions.append((frac * float(rows), frac * float(cols)))
+        return np.asarray(positions, dtype=np.float32)
+
+    def robot_module_distances(self) -> np.ndarray:
+        """Manhattan distance from every robot to every module center."""
+
+        delta = np.abs(self.robot_positions[:, None, :] - self.module_positions[None, :, :])
+        return np.sum(delta, axis=2).astype(np.float32)
+
+    def _travel_time_for(self, module: int, robots: List[int]) -> int:
+        distances = self.robot_module_distances()[robots, module]
+        farthest_distance = float(np.max(distances)) if len(distances) else 0.0
+        return int(np.ceil(farthest_distance / max(1.0e-6, self.travel_speed_cells_per_step)))
 
     def _sample_dependencies(self) -> List[List[int]]:
         deps: List[List[int]] = [[] for _ in range(self.num_modules)]
@@ -144,6 +201,7 @@ class ConstructionSchedulingEnv:
         self.module_completion_time = np.ones(self.num_modules, dtype=np.int32) * -1
         self.module_completion_order = np.ones(self.num_modules, dtype=np.int32) * -1
         self.heavy_mask = self._sample_heavy_modules()
+        self.robot_positions = self.robot_start_positions.copy()
         self.module_owners = np.zeros((self.num_modules, self.num_robots), dtype=np.float32)
         self.robot_task = np.ones(self.num_robots, dtype=np.int64) * self.wait_action
         self.robot_remaining_time = np.zeros(self.num_robots, dtype=np.float32)
@@ -161,6 +219,7 @@ class ConstructionSchedulingEnv:
         remaining_norm = self.remaining_module_time / float(max(1, self.heavy_base_duration + 2))
         robot_remaining_norm = self.robot_remaining_time / float(max(1, self.heavy_base_duration + 2))
         capability_flat = self.robot_capabilities.reshape(-1) / 1.5
+        position_norm = self.robot_positions.reshape(-1) / float(max(1, max(self.grid_shape)))
         return np.concatenate(
             [
                 self.completed,
@@ -171,6 +230,7 @@ class ConstructionSchedulingEnv:
                 self.robot_status / 2.0,
                 robot_remaining_norm,
                 capability_flat,
+                position_norm,
                 self.cooperation_requests,
                 np.array([self.resource_occupied], dtype=np.float32),
                 np.array([self.crane_cooldown / float(max(1, self.crane_cooldown_steps))], dtype=np.float32),
@@ -185,7 +245,11 @@ class ConstructionSchedulingEnv:
             robot_id = np.zeros(self.num_robots, dtype=np.float32)
             robot_id[rid] = 1.0
             own_capability = self.robot_capabilities[rid] / 1.5
-            observations.append(np.concatenate([shared, robot_id, own_capability]).astype(np.float32))
+            own_position = self.robot_positions[rid] / float(max(1, max(self.grid_shape)))
+            own_distances = self.robot_module_distances()[rid] / self.max_travel_distance
+            observations.append(
+                np.concatenate([shared, robot_id, own_capability, own_position, own_distances]).astype(np.float32)
+            )
         return np.stack(observations)
 
     def action_mask(self) -> np.ndarray:
@@ -205,8 +269,9 @@ class ConstructionSchedulingEnv:
         base = self.heavy_base_duration if is_heavy else self.normal_base_duration
         col = 1 if is_heavy else 0
         multiplier = float(np.mean(self.robot_capabilities[robots, col]))
+        travel_time = self._travel_time_for(module, robots)
         stochastic_delay = int(self.rng.random() < self.delay_probability)
-        return max(1, int(np.ceil(base * multiplier)) + stochastic_delay)
+        return max(1, travel_time + int(np.ceil(base * multiplier)) + stochastic_delay)
 
     def _advance_active_tasks(self, stats: StepStats) -> float:
         reward = 0.0
@@ -224,6 +289,7 @@ class ConstructionSchedulingEnv:
                 self.remaining_module_time[module] = 0.0
                 self.last_completed_modules.append(int(module))
                 for rid in owner_ids:
+                    self.robot_positions[rid] = self.module_positions[module]
                     self.robot_task[rid] = self.wait_action
                     self.robot_remaining_time[rid] = 0.0
                     self.robot_status[rid] = 0.0
@@ -307,6 +373,9 @@ class ConstructionSchedulingEnv:
 
         for module, robots, is_heavy in sorted(start_candidates, key=lambda item: item[0]):
             duration = self._duration_for(module, robots, is_heavy)
+            travel_distance = float(np.sum(self.robot_module_distances()[robots, module]))
+            stats.travel_distance += travel_distance
+            reward -= self.travel_reward_weight * travel_distance
             self.in_progress[module] = 1.0
             self.remaining_module_time[module] = float(duration)
             self.module_owners[module, :] = 0.0
@@ -399,8 +468,10 @@ class ConstructionSchedulingEnv:
             return 0, 0
         return max(0, (len(text) * 4 - 1) * scale), 5 * scale
 
-    def render_rgb(self, cell_size: int = 64) -> np.ndarray:
+    def render_rgb(self, cell_size: int | None = None) -> np.ndarray:
         rows, cols = self.grid_shape
+        if cell_size is None:
+            cell_size = max(36, min(64, 720 // max(rows, cols)))
         header = 42
         legend = 92
         image = np.ones((rows * cell_size + header, cols * cell_size + legend, 3), dtype=np.uint8) * 245
@@ -410,6 +481,10 @@ class ConstructionSchedulingEnv:
                 [58, 126, 196],
                 [70, 156, 90],
                 [145, 92, 182],
+                [213, 122, 46],
+                [78, 158, 160],
+                [172, 84, 116],
+                [105, 118, 190],
             ],
             dtype=np.uint8,
         )
@@ -447,7 +522,8 @@ class ConstructionSchedulingEnv:
             image[y0:y1, x1 - 2 : x1] = 40
 
             if self.remaining_module_time[module] > 0:
-                max_time = max(1.0, float(self.heavy_base_duration + 2))
+                max_travel_time = np.ceil(self.max_travel_distance / self.travel_speed_cells_per_step)
+                max_time = max(1.0, float(self.heavy_base_duration + max_travel_time + 2))
                 bar_width = int((cell_size - 12) * min(1.0, self.remaining_module_time[module] / max_time))
                 image[y0 + 6 : y0 + 12, x0 + 6 : x0 + 6 + bar_width] = np.array([40, 40, 40], dtype=np.uint8)
                 self._draw_text(
@@ -460,7 +536,8 @@ class ConstructionSchedulingEnv:
                 )
             elif self.completed[module] > 0.5:
                 label = str(int(self.module_completion_order[module]))
-                text_w, text_h = self._text_size(label, scale=3)
+                label_scale = 3 if cell_size >= 58 and len(label) <= 3 else 2
+                text_w, text_h = self._text_size(label, scale=label_scale)
                 label_x = x0 + (cell_size - text_w) // 2
                 label_y = y0 + (cell_size - text_h) // 2 - 3
                 bg_pad = 5
@@ -474,7 +551,7 @@ class ConstructionSchedulingEnv:
                     label_x,
                     label_y,
                     np.array([35, 35, 35], dtype=np.uint8),
-                    scale=3,
+                    scale=label_scale,
                 )
 
             owners = np.where(self.module_owners[module] > 0.5)[0]
@@ -499,19 +576,29 @@ class ConstructionSchedulingEnv:
                     if my1 > my0:
                         image[my0:my1, mx0:mx1] = robot_colors[robot_id % len(robot_colors)]
 
+        for rid, position in enumerate(self.robot_positions):
+            py = int(header + position[0] * cell_size)
+            px = int(position[1] * cell_size)
+            py = int(np.clip(py, header + 4, header + rows * cell_size - 5))
+            px = int(np.clip(px, 4, cols * cell_size - 5))
+            image[py - 4 : py + 5, px - 4 : px + 5] = np.array([35, 35, 35], dtype=np.uint8)
+            image[py - 3 : py + 4, px - 3 : px + 4] = robot_colors[rid % len(robot_colors)]
+
         lx0 = cols * cell_size + 8
         image[:, cols * cell_size :, :] = np.array([250, 250, 250], dtype=np.uint8)
         for rid in range(self.num_robots):
             y = header + 10 + rid * 24
             image[y : y + 14, lx0 : lx0 + 24] = robot_colors[rid % len(robot_colors)]
             if self.robot_remaining_time[rid] > 0:
-                busy_width = int(46 * min(1.0, self.robot_remaining_time[rid] / float(self.heavy_base_duration + 2)))
+                max_travel_time = np.ceil(self.max_travel_distance / self.travel_speed_cells_per_step)
+                max_busy_time = float(self.heavy_base_duration + max_travel_time + 2)
+                busy_width = int(46 * min(1.0, self.robot_remaining_time[rid] / max_busy_time))
                 image[y + 4 : y + 10, lx0 + 32 : lx0 + 32 + busy_width] = np.array([40, 40, 40], dtype=np.uint8)
             else:
                 image[y + 4 : y + 10, lx0 + 32 : lx0 + 46] = np.array([170, 210, 170], dtype=np.uint8)
         return image
 
-    def render_dag_rgb(self, width: int = 980, height: int = 720) -> np.ndarray:
+    def render_dag_rgb(self, width: int = 1280, height: int = 900) -> np.ndarray:
         """Render the dependency DAG as an RGB image for report/video figures.
 
         Edges point from prerequisite modules to dependent modules. Node fill:
@@ -581,7 +668,7 @@ class ConstructionSchedulingEnv:
             ax.scatter(
                 [x],
                 [y],
-                s=520 if is_heavy else 440,
+                s=360 if self.num_modules >= 80 else (520 if is_heavy else 440),
                 marker=marker,
                 c=color,
                 edgecolors="#303030",
@@ -595,7 +682,8 @@ class ConstructionSchedulingEnv:
                 label = f"R{int(self.remaining_module_time[module])}"
             else:
                 label = str(module)
-            ax.text(x, y, label, ha="center", va="center", fontsize=8, color="#202020", zorder=4)
+            label_font = 6 if self.num_modules >= 80 else 8
+            ax.text(x, y, label, ha="center", va="center", fontsize=label_font, color="#202020", zorder=4)
 
         ax.text(
             0.01,

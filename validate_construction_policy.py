@@ -36,6 +36,8 @@ def build_agent_and_env(model_path: str) -> Tuple[ConstructionSchedulingEnv, Sha
         num_robots=cfg.robots,
         heavy_ratio=cfg.heavy_ratio,
         max_steps=cfg.max_steps,
+        travel_speed_cells_per_step=cfg.travel_speed_cells_per_step,
+        travel_reward_weight=cfg.travel_reward_weight,
         seed=cfg.seed + 999,
     )
     obs, state = env.reset()
@@ -110,6 +112,8 @@ def main() -> None:
         num_robots=cfg.robots,
         heavy_ratio=cfg.heavy_ratio,
         max_steps=cfg.max_steps,
+        travel_speed_cells_per_step=cfg.travel_speed_cells_per_step,
+        travel_reward_weight=cfg.travel_reward_weight,
         seed=cfg.seed + 1234,
     )
     baseline_episode = run_greedy_baseline(baseline_env)
@@ -123,6 +127,8 @@ def main() -> None:
             num_robots=cfg.robots,
             heavy_ratio=cfg.heavy_ratio,
             max_steps=cfg.max_steps,
+            travel_speed_cells_per_step=cfg.travel_speed_cells_per_step,
+            travel_reward_weight=cfg.travel_reward_weight,
             seed=cfg.seed + 1234,
         )
         baseline_dag_episode = run_greedy_baseline(baseline_dag_env, render_mode="dag")

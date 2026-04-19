@@ -9,6 +9,7 @@ centralized MLP critic for the team state.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 from dataclasses import asdict, dataclass
@@ -114,27 +115,31 @@ class MLP:
 
 @dataclass
 class TrainConfig:
-    grid_rows: int = 4
-    grid_cols: int = 4
-    robots: int = 3
+    grid_rows: int = 10
+    grid_cols: int = 10
+    robots: int = 6
     heavy_ratio: float = 0.25
-    max_steps: int = 100
-    bc_episodes: int = 1000
-    bc_epochs: int = 60
-    episodes: int = 1200
+    max_steps: int = 900
+    bc_episodes: int = 500
+    bc_epochs: int = 30
+    episodes: int = 700
     gamma: float = 0.97
     actor_lr: float = 3.0e-4
     critic_lr: float = 1.0e-3
     seed: int = 7
     save_dir: str = "construction_models"
     model_name: str = "construction_mappo_numpy.npz"
+    plot_interval: int = 10
+    plot_path: str = "results/training_curves.png"
+    travel_speed_cells_per_step: float = 3.0
+    travel_reward_weight: float = 0.01
 
 
 class SharedActorCentralCritic:
     def __init__(self, obs_dim: int, state_dim: int, action_dim: int, rng: np.random.Generator, cfg: TrainConfig):
         self.action_dim = action_dim
-        self.actor = MLP(obs_dim, (128, 128), action_dim, rng)
-        self.critic = MLP(state_dim, (128, 128), 1, rng)
+        self.actor = MLP(obs_dim, (256, 256), action_dim, rng)
+        self.critic = MLP(state_dim, (256, 256), 1, rng)
         self.actor_opt = Adam(cfg.actor_lr)
         self.critic_opt = Adam(cfg.critic_lr)
 
@@ -208,8 +213,87 @@ def discounted_returns(rewards: List[float], gamma: float) -> np.ndarray:
     return out
 
 
+def update_training_curve_plot(history_path: str, output_path: str) -> None:
+    """Save a compact training-curve figure that can be refreshed while training."""
+
+    if not os.path.exists(history_path):
+        return
+
+    rows = []
+    with open(history_path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append(row)
+    if not rows:
+        return
+
+    episodes = np.asarray([int(row["episode"]) for row in rows], dtype=np.int32)
+    rewards = np.asarray([float(row["reward"]) for row in rows], dtype=np.float32)
+    lengths = np.asarray([float(row["length"]) for row in rows], dtype=np.float32)
+    successes = np.asarray([float(row["success"]) for row in rows], dtype=np.float32)
+    critic_loss = np.asarray([float(row["critic_loss"]) for row in rows], dtype=np.float32)
+    policy_loss = np.asarray([float(row["policy_loss"]) for row in rows], dtype=np.float32)
+
+    def moving_average(values: np.ndarray, window: int = 10) -> np.ndarray:
+        if len(values) < 2:
+            return values
+        window = min(window, len(values))
+        kernel = np.ones(window, dtype=np.float32) / float(window)
+        prefix = np.full(window - 1, values[0], dtype=np.float32)
+        padded = np.concatenate([prefix, values])
+        return np.convolve(padded, kernel, mode="valid")
+
+    os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    fig, axes = plt.subplots(2, 2, figsize=(11, 7), dpi=140)
+    fig.patch.set_facecolor("white")
+
+    axes[0, 0].scatter(episodes, rewards, color="#9aa3ad", s=13, alpha=0.7)
+    axes[0, 0].plot(episodes, rewards, color="#c4c9cf", linewidth=0.8, alpha=0.7)
+    axes[0, 0].plot(episodes, moving_average(rewards), color="#2f6f9f", linewidth=2.0)
+    axes[0, 0].set_title("Episode Reward")
+    axes[0, 0].set_xlabel("Episode")
+    axes[0, 0].set_ylabel("Reward")
+
+    axes[0, 1].scatter(episodes, lengths, color="#9aa3ad", s=13, alpha=0.7)
+    axes[0, 1].plot(episodes, lengths, color="#c4c9cf", linewidth=0.8, alpha=0.7)
+    axes[0, 1].plot(episodes, moving_average(lengths), color="#7d5ba6", linewidth=2.0)
+    axes[0, 1].set_title("Episode Length")
+    axes[0, 1].set_xlabel("Episode")
+    axes[0, 1].set_ylabel("Steps")
+
+    axes[1, 0].plot(episodes, moving_average(successes, window=20), color="#3f8f56", linewidth=2.0)
+    axes[1, 0].scatter(episodes, successes, color="#8dc79c", s=13, alpha=0.7)
+    axes[1, 0].set_ylim(-0.05, 1.05)
+    axes[1, 0].set_title("Episode Success")
+    axes[1, 0].set_xlabel("Episode")
+    axes[1, 0].set_ylabel("Success")
+
+    axes[1, 1].plot(episodes, critic_loss, color="#ba4a4a", linewidth=1.4, label="critic")
+    axes[1, 1].plot(episodes, policy_loss, color="#4e7fba", linewidth=1.4, label="policy")
+    axes[1, 1].set_title("Training Loss")
+    axes[1, 1].set_xlabel("Episode")
+    axes[1, 1].set_ylabel("Loss")
+    axes[1, 1].legend(frameon=False)
+
+    for ax in axes.reshape(-1):
+        ax.grid(True, alpha=0.25)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    fig.suptitle("10x10 Multi-Robot Construction Scheduling Training", fontsize=13)
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
 def greedy_baseline_action(env: ConstructionSchedulingEnv) -> np.ndarray:
-    """Capability-aware online greedy scheduler used as a baseline/warm start."""
+    """Capability- and distance-aware online greedy scheduler."""
 
     available = env.dependency_mask()
     actions = np.ones(env.num_robots, dtype=np.int64) * env.wait_action
@@ -220,22 +304,134 @@ def greedy_baseline_action(env: ConstructionSchedulingEnv) -> np.ndarray:
 
     heavy_available = np.where((available > 0.5) & (env.heavy_mask > 0.5))[0]
     normal_available = np.where((available > 0.5) & (env.heavy_mask < 0.5))[0]
+    distances = env.robot_module_distances()
 
     remaining_idle = list(int(x) for x in idle)
 
     if env.crane_cooldown == 0 and len(heavy_available) > 0 and len(remaining_idle) >= 2:
-        idle_array = np.asarray(remaining_idle, dtype=np.int64)
-        heavy_speed = env.robot_capabilities[idle_array, 1]
-        pair_order = np.argsort(heavy_speed)[:2]
-        chosen = idle_array[pair_order]
-        actions[chosen] = int(heavy_available[0])
-        remaining_idle = [rid for rid in remaining_idle if rid not in set(int(x) for x in chosen)]
+        best_choice = None
+        best_cost = float("inf")
+        for module in heavy_available:
+            for idx, rid_a in enumerate(remaining_idle):
+                for rid_b in remaining_idle[idx + 1 :]:
+                    pair = [rid_a, rid_b]
+                    travel_time = float(np.max(distances[pair, int(module)])) / env.travel_speed_cells_per_step
+                    capability_cost = float(np.mean(env.robot_capabilities[pair, 1]))
+                    cost = travel_time + capability_cost + 0.02 * float(np.sum(distances[pair, int(module)]))
+                    if cost < best_cost:
+                        best_cost = cost
+                        best_choice = (int(module), pair)
+        if best_choice is not None:
+            module, chosen = best_choice
+            actions[chosen] = module
+            remaining_idle = [rid for rid in remaining_idle if rid not in set(int(x) for x in chosen)]
 
     if len(normal_available) > 0 and remaining_idle:
-        idle_array = np.asarray(remaining_idle, dtype=np.int64)
-        normal_order = idle_array[np.argsort(env.robot_capabilities[idle_array, 0])]
-        for robot_id, module in zip(normal_order, normal_available):
-            actions[int(robot_id)] = int(module)
+        candidate_pairs = []
+        for rid in remaining_idle:
+            for module in normal_available:
+                cost = (
+                    float(distances[rid, int(module)]) / env.travel_speed_cells_per_step
+                    + float(env.robot_capabilities[rid, 0])
+                )
+                candidate_pairs.append((cost, rid, int(module)))
+        candidate_pairs.sort(key=lambda item: item[0])
+        assigned_robots = set()
+        assigned_modules = set()
+        for _, rid, module in candidate_pairs:
+            if rid in assigned_robots or module in assigned_modules:
+                continue
+            actions[rid] = module
+            assigned_robots.add(rid)
+            assigned_modules.add(module)
+            if len(assigned_robots) == len(remaining_idle):
+                break
+    return actions
+
+
+def policy_guided_safe_action(
+    env: ConstructionSchedulingEnv,
+    agent: SharedActorCentralCritic,
+    observations: np.ndarray,
+    masks: np.ndarray,
+) -> np.ndarray:
+    """Decode independent policy scores into a feasible multi-robot action.
+
+    The shared actor still decides task preferences. This decoder only enforces
+    the construction constraints that are hard for independent argmax to satisfy
+    on a 100-module action space: distinct normal-task assignment, heavy-task
+    pairing, and no action for busy robots.
+    """
+
+    logits, _ = agent.actor.forward(observations)
+    probs = masked_softmax(logits, masks)
+    actions = np.ones(env.num_robots, dtype=np.int64) * env.wait_action
+
+    available = env.dependency_mask()
+    distances = env.robot_module_distances()
+    idle = [int(rid) for rid in np.where(env.robot_remaining_time <= 0)[0]]
+    if not idle:
+        return actions
+
+    heavy_available = [
+        int(module)
+        for module in np.where((available > 0.5) & (env.heavy_mask > 0.5))[0]
+        if masks[idle, module].max(initial=0.0) > 0.5
+    ]
+    normal_available = [
+        int(module)
+        for module in np.where((available > 0.5) & (env.heavy_mask < 0.5))[0]
+        if masks[idle, module].max(initial=0.0) > 0.5
+    ]
+
+    remaining_idle = set(idle)
+
+    if env.crane_cooldown == 0 and len(remaining_idle) >= 2 and heavy_available:
+        best_choice = None
+        best_score = -np.inf
+        for module in heavy_available:
+            ranked = sorted(
+                remaining_idle,
+                key=lambda rid: float(probs[rid, module])
+                / (
+                    max(0.25, float(env.robot_capabilities[rid, 1]))
+                    * (1.0 + float(distances[rid, module]) / env.max_travel_distance)
+                ),
+                reverse=True,
+            )
+            if len(ranked) < 2:
+                continue
+            pair = ranked[:2]
+            score = float(probs[pair[0], module] + probs[pair[1], module])
+            if score > best_score:
+                best_score = score
+                best_choice = (module, pair)
+        if best_choice is not None:
+            module, pair = best_choice
+            for rid in pair:
+                actions[rid] = module
+                remaining_idle.remove(rid)
+
+    normal_pairs = []
+    for rid in remaining_idle:
+        for module in normal_available:
+            score = float(probs[rid, module]) / (
+                max(0.25, float(env.robot_capabilities[rid, 0]))
+                * (1.0 + float(distances[rid, module]) / env.max_travel_distance)
+            )
+            normal_pairs.append((score, rid, module))
+    normal_pairs.sort(reverse=True)
+
+    used_modules = set()
+    for _, rid, module in normal_pairs:
+        if rid not in remaining_idle or module in used_modules:
+            continue
+        actions[rid] = module
+        remaining_idle.remove(rid)
+        used_modules.add(module)
+        if not remaining_idle:
+            break
+
     return actions
 
 
@@ -308,7 +504,10 @@ def collect_episode(
 
     while not done:
         masks = env.action_mask()
-        actions, _, _ = agent.act(obs, masks, rng, greedy=greedy)
+        if greedy:
+            actions = policy_guided_safe_action(env, agent, obs, masks)
+        else:
+            actions, _, _ = agent.act(obs, masks, rng, greedy=False)
         next_obs, next_state, reward, done, info = env.step(actions)
 
         states.append(state)
@@ -383,6 +582,8 @@ def train(cfg: TrainConfig) -> str:
         num_robots=cfg.robots,
         heavy_ratio=cfg.heavy_ratio,
         max_steps=cfg.max_steps,
+        travel_speed_cells_per_step=cfg.travel_speed_cells_per_step,
+        travel_reward_weight=cfg.travel_reward_weight,
         seed=cfg.seed,
     )
     obs, state = env.reset()
@@ -414,6 +615,8 @@ def train(cfg: TrainConfig) -> str:
                 f"{episode_id},{ep_reward:.4f},{ep_len},{success:.0f},{completed},"
                 f"{losses['critic_loss']:.6f},{losses['policy_loss']:.6f},{losses['entropy']:.6f}\n"
             )
+        if cfg.plot_interval > 0 and (episode_id == 1 or episode_id % cfg.plot_interval == 0):
+            update_training_curve_plot(history_path, cfg.plot_path)
 
         if episode_id % 100 == 0 or episode_id == 1:
             metrics = evaluate(env, agent, episodes=20, seed=cfg.seed + episode_id)
@@ -430,21 +633,26 @@ def train(cfg: TrainConfig) -> str:
 
     final_path = os.path.join(cfg.save_dir, "final_" + cfg.model_name)
     agent.save(final_path, cfg)
+    update_training_curve_plot(history_path, cfg.plot_path)
     return model_path
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--episodes", type=int, default=1200)
-    parser.add_argument("--bc-episodes", type=int, default=1000)
-    parser.add_argument("--bc-epochs", type=int, default=60)
-    parser.add_argument("--robots", type=int, default=3)
-    parser.add_argument("--grid-rows", type=int, default=4)
-    parser.add_argument("--grid-cols", type=int, default=4)
+    parser.add_argument("--episodes", type=int, default=700)
+    parser.add_argument("--bc-episodes", type=int, default=500)
+    parser.add_argument("--bc-epochs", type=int, default=30)
+    parser.add_argument("--robots", type=int, default=6)
+    parser.add_argument("--grid-rows", type=int, default=10)
+    parser.add_argument("--grid-cols", type=int, default=10)
     parser.add_argument("--heavy-ratio", type=float, default=0.25)
-    parser.add_argument("--max-steps", type=int, default=100)
+    parser.add_argument("--max-steps", type=int, default=900)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--save-dir", type=str, default="construction_models")
+    parser.add_argument("--plot-interval", type=int, default=10)
+    parser.add_argument("--plot-path", type=str, default="results/training_curves.png")
+    parser.add_argument("--travel-speed", type=float, default=3.0)
+    parser.add_argument("--travel-reward-weight", type=float, default=0.01)
     args = parser.parse_args()
 
     cfg = TrainConfig(
@@ -458,6 +666,10 @@ def main() -> None:
         max_steps=args.max_steps,
         seed=args.seed,
         save_dir=args.save_dir,
+        plot_interval=args.plot_interval,
+        plot_path=args.plot_path,
+        travel_speed_cells_per_step=args.travel_speed,
+        travel_reward_weight=args.travel_reward_weight,
     )
     model_path = train(cfg)
     print(f"saved model: {model_path}")
