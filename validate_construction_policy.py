@@ -166,7 +166,7 @@ def evaluate_policy_detailed(
                 actions = greedy_baseline_action(env)
             else:
                 masks = env.action_mask()
-                actions = agent.act(obs, masks, greedy=True)
+                actions, _, _ = agent.act(obs, masks, rng, greedy=True)
 
             obs, state, reward, done, info = env.step(actions)
             rewards.append(reward)
