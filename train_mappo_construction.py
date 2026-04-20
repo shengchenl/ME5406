@@ -20,7 +20,10 @@ import numpy as np
 
 from construction_scheduling_env import ConstructionSchedulingEnv
 
-
+# ==================== Softmax over Legal Actions ====================
+# invalid actions = huge negative
+# softmax = scores become probabilities
+# -- Invalid Actions get 0 Probability
 def masked_softmax(logits: np.ndarray, mask: np.ndarray) -> np.ndarray:
     masked = logits.copy()
     masked[mask < 0.5] = -1.0e9
@@ -30,6 +33,8 @@ def masked_softmax(logits: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return exp / np.maximum(total, 1.0e-8)
 
 
+# ================ Adam Optimizer ==================
+# gradient descent method to update NN weights
 class Adam:
     def __init__(self, lr: float = 3.0e-4, beta1: float = 0.9, beta2: float = 0.999, eps: float = 1.0e-8):
         self.lr = lr
@@ -53,6 +58,7 @@ class Adam:
             p -= self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
 
 
+# ================= Feedforward Neural Network =====================
 class MLP:
     def __init__(self, input_dim: int, hidden_dims: Tuple[int, ...], output_dim: int, rng: np.random.Generator):
         dims = (input_dim,) + hidden_dims + (output_dim,)
@@ -113,6 +119,7 @@ class MLP:
             self.biases[i][...] = data[f"{prefix}_b{i}"]
 
 
+# =========== Hyperparameters ==============
 @dataclass
 class TrainConfig:
     grid_rows: int = 10
@@ -135,6 +142,16 @@ class TrainConfig:
     travel_reward_weight: float = 0.01
 
 
+# ================= Core Agent Class =======================
+# Actor:
+#  - shared across all robots
+#  - input: robot observation
+#  - output: logits over actions
+#
+# Critic:
+#  - centralized
+#  - input: global state
+#  - output: scalar value
 class SharedActorCentralCritic:
     def __init__(self, obs_dim: int, state_dim: int, action_dim: int, rng: np.random.Generator, cfg: TrainConfig):
         self.action_dim = action_dim
@@ -143,6 +160,7 @@ class SharedActorCentralCritic:
         self.actor_opt = Adam(cfg.actor_lr)
         self.critic_opt = Adam(cfg.critic_lr)
 
+    # Action Selection Step
     def act(self, observations: np.ndarray, masks: np.ndarray, rng: np.random.Generator, greedy: bool = False):
         logits, _ = self.actor.forward(observations)
         probs = masked_softmax(logits, masks)
@@ -157,10 +175,12 @@ class SharedActorCentralCritic:
             log_probs.append(float(np.log(max(prob[action], 1.0e-8))))
         return np.asarray(actions, dtype=np.int64), probs, np.asarray(log_probs, dtype=np.float32)
 
+    # Runs Critic on Centralized States
     def values(self, states: np.ndarray) -> np.ndarray:
         value, _ = self.critic.forward(states)
         return value.reshape(-1)
 
+    # Training Update (MAPPO inspired) - not full PPO yet
     def update(self, batch: Dict[str, np.ndarray]) -> Dict[str, float]:
         states = batch["states"]
         returns = batch["returns"]
@@ -204,6 +224,7 @@ class SharedActorCentralCritic:
         self.critic.load_state_dict(data, "critic")
 
 
+# ================ Compute Returns ====================
 def discounted_returns(rewards: List[float], gamma: float) -> np.ndarray:
     out = np.zeros(len(rewards), dtype=np.float32)
     running = 0.0
@@ -213,6 +234,7 @@ def discounted_returns(rewards: List[float], gamma: float) -> np.ndarray:
     return out
 
 
+# =================== Visualize Curve ====================
 def update_training_curve_plot(history_path: str, output_path: str) -> None:
     """Save a compact training-curve figure that can be refreshed while training."""
 
@@ -292,6 +314,7 @@ def update_training_curve_plot(history_path: str, output_path: str) -> None:
     plt.close(fig)
 
 
+# =============== Conventional Baseline (to compare with our MAPPO RL) ===================
 def greedy_baseline_action(env: ConstructionSchedulingEnv) -> np.ndarray:
     """Capability- and distance-aware online greedy scheduler."""
 
@@ -349,6 +372,7 @@ def greedy_baseline_action(env: ConstructionSchedulingEnv) -> np.ndarray:
     return actions
 
 
+# =================== Decoding Layer for Learned Policy =====================
 def policy_guided_safe_action(
     env: ConstructionSchedulingEnv,
     agent: SharedActorCentralCritic,
@@ -435,6 +459,8 @@ def policy_guided_safe_action(
     return actions
 
 
+# ================= Start with Conventional Greedy =======================
+# MAPPO to imitate greedy at the start
 def pretrain_actor_with_greedy(
     env: ConstructionSchedulingEnv,
     agent: SharedActorCentralCritic,
@@ -484,6 +510,7 @@ def pretrain_actor_with_greedy(
             print(f"bc epoch {epoch + 1:02d} | demo accuracy {acc:.2f}")
 
 
+# ================= Run one Episode ==========================
 def collect_episode(
     env: ConstructionSchedulingEnv,
     agent: SharedActorCentralCritic,
@@ -531,6 +558,7 @@ def collect_episode(
     }
 
 
+# ====================== Convert one Episode to Training Batch =======================
 def make_batch(episode: Dict, agent: SharedActorCentralCritic, gamma: float) -> Dict[str, np.ndarray]:
     returns = discounted_returns(episode["rewards"].tolist(), gamma)
     values = agent.values(episode["states"])
@@ -548,6 +576,7 @@ def make_batch(episode: Dict, agent: SharedActorCentralCritic, gamma: float) -> 
     }
 
 
+# ========================== Evaluation ==========================
 def evaluate(env: ConstructionSchedulingEnv, agent: SharedActorCentralCritic, episodes: int, seed: int):
     rng = np.random.default_rng(seed)
     lengths, rewards, successes, conflicts, violations = [], [], [], [], []
@@ -575,6 +604,7 @@ def evaluate(env: ConstructionSchedulingEnv, agent: SharedActorCentralCritic, ep
     }
 
 
+# ====================== Full Training Loop ==================================
 def train(cfg: TrainConfig) -> str:
     rng = np.random.default_rng(cfg.seed)
     env = ConstructionSchedulingEnv(
