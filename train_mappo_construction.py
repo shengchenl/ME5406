@@ -21,9 +21,12 @@ import numpy as np
 from construction_scheduling_env import ConstructionSchedulingEnv
 
 # ==================== Softmax over Legal Actions ====================
-# invalid actions = huge negative
-# softmax = scores become probabilities
-# -- Invalid Actions get 0 Probability
+"""
+invalid actions = huge negative
+ softmax = scores become probabilities
+
+ Invalid Actions pushed to 0 probability
+"""
 def masked_softmax(logits: np.ndarray, mask: np.ndarray) -> np.ndarray:
     masked = logits.copy()
     masked[mask < 0.5] = -1.0e9
@@ -34,7 +37,10 @@ def masked_softmax(logits: np.ndarray, mask: np.ndarray) -> np.ndarray:
 
 
 # ================ Adam Optimizer ==================
-# gradient descent method to update NN weights
+"""
+gradient descent method to update NN weights during backpropagation
+already Full
+"""
 class Adam:
     def __init__(self, lr: float = 3.0e-4, beta1: float = 0.9, beta2: float = 0.999, eps: float = 1.0e-8):
         self.lr = lr
@@ -58,7 +64,17 @@ class Adam:
             p -= self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
 
 
-# ================= Feedforward Neural Network =====================
+# ================= MLP - Feedforward Neural Network =====================
+"""
+Deep Learning
+
+ tanh hidden layers
+
+ actor: observation -> logits over actions
+ critic: global state -> scalar value
+
+ can be optimized no. of layers, activation func etc. 
+"""
 class MLP:
     def __init__(self, input_dim: int, hidden_dims: Tuple[int, ...], output_dim: int, rng: np.random.Generator):
         dims = (input_dim,) + hidden_dims + (output_dim,)
@@ -120,6 +136,9 @@ class MLP:
 
 
 # =========== Hyperparameters ==============
+""" 
+not enough for full MAPPO
+"""
 @dataclass
 class TrainConfig:
     grid_rows: int = 10
@@ -142,16 +161,19 @@ class TrainConfig:
     travel_reward_weight: float = 0.01
 
 
-# ================= Core Agent Class =======================
-# Actor:
-#  - shared across all robots
-#  - input: robot observation
-#  - output: logits over actions
-#
-# Critic:
-#  - centralized
-#  - input: global state
-#  - output: scalar value
+# ================= Core Agent Class ======================= Main thing to Change ####
+"""
+ Actor:
+  - shared across all robots
+  - input: robot observation
+  - output: logits over actions
+
+ Critic:
+  - centralized
+  - input: global state
+  - output: scalar value
+  
+"""
 class SharedActorCentralCritic:
     def __init__(self, obs_dim: int, state_dim: int, action_dim: int, rng: np.random.Generator, cfg: TrainConfig):
         self.action_dim = action_dim
@@ -161,6 +183,11 @@ class SharedActorCentralCritic:
         self.critic_opt = Adam(cfg.critic_lr)
 
     # Action Selection Step
+    """
+    1. runs actor on each robot observation
+    2. applies action masking
+    3. samples actions from resulting policy
+    """
     def act(self, observations: np.ndarray, masks: np.ndarray, rng: np.random.Generator, greedy: bool = False):
         logits, _ = self.actor.forward(observations)
         probs = masked_softmax(logits, masks)
@@ -176,11 +203,18 @@ class SharedActorCentralCritic:
         return np.asarray(actions, dtype=np.int64), probs, np.asarray(log_probs, dtype=np.float32)
 
     # Runs Critic on Centralized States
+    """
+    runs critic on global state
+    """
     def values(self, states: np.ndarray) -> np.ndarray:
         value, _ = self.critic.forward(states)
         return value.reshape(-1)
 
     # Training Update (MAPPO inspired) - not full PPO yet
+    """
+    1. updates critic using MSE between predicted values and returns
+    2. updates actor using a simple policy-gradient style loss (not full MAPPO)
+    """
     def update(self, batch: Dict[str, np.ndarray]) -> Dict[str, float]:
         states = batch["states"]
         returns = batch["returns"]
@@ -210,6 +244,7 @@ class SharedActorCentralCritic:
         entropy = float(np.mean(-np.sum(probs * np.log(np.maximum(probs, 1.0e-8)), axis=1)))
         return {"critic_loss": critic_loss, "policy_loss": policy_loss, "entropy": entropy}
 
+    # save model weights
     def save(self, path: str, cfg: TrainConfig) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         data = {}
@@ -218,6 +253,7 @@ class SharedActorCentralCritic:
         data["config_json"] = np.array(json.dumps(asdict(cfg)))
         np.savez(path, **data)
 
+    # reloads model weights
     def load(self, path: str) -> None:
         data = dict(np.load(path, allow_pickle=True))
         self.actor.load_state_dict(data, "actor")
@@ -225,6 +261,13 @@ class SharedActorCentralCritic:
 
 
 # ================ Compute Returns ====================
+"""
+compute Monte Carlo discounted returns for one episode
+
+Total Future Reward from a time step forward (later rewards discounted)
+
+for real PPO - TD + GAE
+"""
 def discounted_returns(rewards: List[float], gamma: float) -> np.ndarray:
     out = np.zeros(len(rewards), dtype=np.float32)
     running = 0.0
@@ -315,6 +358,10 @@ def update_training_curve_plot(history_path: str, output_path: str) -> None:
 
 
 # =============== Conventional Baseline (to compare with our MAPPO RL) ===================
+"""
+Conventional Heuristic Scheduler
+assigns robot pairs to heavy modules and single robots to normal modules using travel dist and capability costs
+"""
 def greedy_baseline_action(env: ConstructionSchedulingEnv) -> np.ndarray:
     """Capability- and distance-aware online greedy scheduler."""
 
@@ -373,6 +420,12 @@ def greedy_baseline_action(env: ConstructionSchedulingEnv) -> np.ndarray:
 
 
 # =================== Decoding Layer for Learned Policy =====================
+"""
+During validation: takes actor probabilites and turns them into feasible joint actions:
+- no duplicate normal assignments
+- heavy modules get paired robots
+- busy robots do not act
+"""
 def policy_guided_safe_action(
     env: ConstructionSchedulingEnv,
     agent: SharedActorCentralCritic,
@@ -460,7 +513,9 @@ def policy_guided_safe_action(
 
 
 # ================= Start with Conventional Greedy =======================
-# MAPPO to imitate greedy at the start
+"""
+MAPPO to imitate greedy at the start (Behaviour Cloning)
+"""
 def pretrain_actor_with_greedy(
     env: ConstructionSchedulingEnv,
     agent: SharedActorCentralCritic,
@@ -510,7 +565,7 @@ def pretrain_actor_with_greedy(
             print(f"bc epoch {epoch + 1:02d} | demo accuracy {acc:.2f}")
 
 
-# ================= Run one Episode ==========================
+# ================= Run one Episode and store data ==========================
 def collect_episode(
     env: ConstructionSchedulingEnv,
     agent: SharedActorCentralCritic,
@@ -559,6 +614,9 @@ def collect_episode(
 
 
 # ====================== Convert one Episode to Training Batch =======================
+"""
+converts episode data into training data used by Neural network for learning
+"""
 def make_batch(episode: Dict, agent: SharedActorCentralCritic, gamma: float) -> Dict[str, np.ndarray]:
     returns = discounted_returns(episode["rewards"].tolist(), gamma)
     values = agent.values(episode["states"])
@@ -605,6 +663,15 @@ def evaluate(env: ConstructionSchedulingEnv, agent: SharedActorCentralCritic, ep
 
 
 # ====================== Full Training Loop ==================================
+"""
+create env
+create agent
+do greedy behavior cloning
+collect one episode at a time
+update actor/critic once per episode
+every 100 episodes evaluate
+save best model
+"""
 def train(cfg: TrainConfig) -> str:
     rng = np.random.default_rng(cfg.seed)
     env = ConstructionSchedulingEnv(
@@ -667,6 +734,7 @@ def train(cfg: TrainConfig) -> str:
     return model_path
 
 
+# =============== Command Line Interface to run training script from terminal =======================
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--episodes", type=int, default=700)
