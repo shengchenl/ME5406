@@ -440,11 +440,81 @@ class RolloutBuffer:
         self.log_probs.append(log_probs)
         self.values.append(values)
 
-    def compute_returns_and_advantages(self, last_value, gamma: float, gae_lambda: float, use_gae: bool = True):
-        raise NotImplementedError("TODO [PERSON 2]: implement GAE / returns")
+    def compute_returns_and_advantages(self, last_value, gamma: float, gae_lambda: float):
+        # 将列表转换为 Tensor
+        rewards = torch.tensor(np.array(self.rewards), dtype=torch.float32)  # [T, N]
+        values = torch.tensor(np.array(self.values), dtype=torch.float32)  # [T, N]
+        dones = torch.tensor(np.array(self.dones), dtype=torch.float32)  # [T, N]
+
+        # 扩展 values 数组以包含 last_value (即 V_next)
+        # 结果维度: [T+1, N]
+        v_next_all = torch.cat([values[1:], last_value.unsqueeze(0)], dim=0)
+
+        self.advantages = torch.zeros_like(rewards)
+        last_gae = 0
+
+        # 倒序遍历计算 GAE
+        for t in reversed(range(len(rewards))):
+            # TD Error: delta = r + gamma * V_next * (1-done) - V_now
+            delta = rewards[t] + gamma * v_next_all[t] * (1.0 - dones[t]) - values[t]
+            # GAE: A_t = delta + gamma * lambda * (1-done) * A_{t+1}
+            self.advantages[t] = last_gae = delta + gamma * gae_lambda * (1.0 - dones[t]) * last_gae
+
+        # Returns = Advantage + Value (作为 Critic 的更新目标)
+        self.returns = self.advantages + values
 
     def get_training_batches(self, minibatch_size: int):
-        raise NotImplementedError("TODO [PERSON 2]: implement minibatching")
+        """
+        一次性处理所有数据，并以列表形式返回所有训练批次。
+        """
+
+        def flatten_to_tensor(data_list, dtype=torch.float32):
+            arr = np.array(data_list)
+            t = torch.tensor(arr, dtype=dtype)
+            return t.view(-1, *t.shape[2:])
+
+        # 1. 准备大表 (Flattened Tensors)
+        obs_f = flatten_to_tensor(self.obs)
+        states_f = flatten_to_tensor(self.states)
+        actions_f = flatten_to_tensor(self.actions, dtype=torch.long)
+        log_probs_f = flatten_to_tensor(self.log_probs)
+        masks_f = flatten_to_tensor(self.action_masks)
+
+        # 处理优势和回报
+        advantages_f = self.advantages.view(-1)
+        returns_f = self.returns.view(-1)
+        # 标准化优势函数
+        advantages_f = (advantages_f - advantages_f.mean()) / (advantages_f.std() + 1e-8)
+
+        # 2. 随机洗牌
+        total_samples = obs_f.size(0)
+        indices = torch.randperm(total_samples)
+
+        # 3. 核心改变：创建一个列表，把切好的“肉”都装进去
+        all_batches = []
+
+        for start in range(0, total_samples, minibatch_size):
+            batch_idx = indices[start: start + minibatch_size]
+
+            # 把这一批数据打包成一个元组 (Tuple)
+            batch_data = (
+                obs_f[batch_idx],
+                states_f[batch_idx],
+                actions_f[batch_idx],
+                log_probs_f[batch_idx],
+                advantages_f[batch_idx],
+                returns_f[batch_idx],
+                masks_f[batch_idx]
+            )
+
+            # 塞进大列表
+            all_batches.append(batch_data)
+
+        # 4. 直接返回这个大列表
+        return all_batches
+
+#调用示例：
+#obs, state, action, log_prob, adv, ret, mask = all_batches[0]
 
 
 # ============================================================
