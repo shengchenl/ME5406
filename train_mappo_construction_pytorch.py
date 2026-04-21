@@ -766,8 +766,49 @@ def pretrain_actor_with_greedy(env: ConstructionSchedulingEnv, agent, episodes: 
 # - action representation
 # - buffer fields and tensor shapes
 
-def collect_episode(env: ConstructionSchedulingEnv, agent, rng: np.random.Generator, greedy: bool = False, render_mode: str = "grid"):
-    raise NotImplementedError("TODO [PERSON 2 / PERSON 3]: implement rollout collection")
+def collect_episode(env: ConstructionSchedulingEnv, agent: MAPPOAgent, buffer: RolloutBuffer, cfg: TrainConfig, rng: np.random.Generator, greedy: bool = False):
+    obs = env.reset() 
+    done = False
+    total_reward = 0
+    step_count = 0
+
+    while not done and step_count < cfg.max_steps:
+        # A. 获取动作掩码 (防止选到不可行的任务)
+        masks = env.get_action_masks() # [num_robots, action_dim]
+
+        # B. 构造全局状态
+        state = obs.flatten() # 形状: [num_robots * obs_dim]
+
+        # C. 将 numpy 转为 torch tensor
+        obs_t = torch.from_numpy(obs).float()
+        mask_t = torch.from_numpy(masks).float()
+        state_t = torch.from_numpy(state).float()
+
+        with torch.no_grad():
+            # 拿到动作、动作的 log 概率
+            actions_t, log_probs_t, _ = agent.get_action_and_logprob(obs_t, mask_t, greedy=greedy)
+            # 拿到 Critic 对局势的评估值
+            value_t = agent.get_value(state_t)
+
+        # D. 环境执行
+        actions_np = actions_t.cpu().numpy()
+        next_obs, rewards, done, info = env.step(actions_np)
+        buffer.add(
+            obs=obs,
+            states=state,
+            actions=actions_np,
+            rewards=rewards,
+            dones=np.array([done] * env.robots), # 记录每个机器人对应的结束标志
+            action_masks=masks,
+            log_probs=log_probs_t.cpu().numpy(),
+            values=value_t.cpu().numpy()
+        )
+
+        obs = next_obs
+        total_reward += np.mean(rewards)
+        step_count += 1
+
+    return total_reward, step_count
 
 
 # ============================================================
