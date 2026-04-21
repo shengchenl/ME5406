@@ -823,9 +823,148 @@ def collect_episode(env: ConstructionSchedulingEnv, agent: MAPPOAgent, buffer: R
 # 6. Multiple PPO epochs
 # 7. Minibatch updates
 
-def ppo_update(agent: MAPPOAgent, buffer: RolloutBuffer, cfg: TrainConfig) -> Dict[str, float]:
-    raise NotImplementedError("TODO [PERSON 3]: implement PPO/MAPPO update")
+#---------------------------- Standardize Model and Data into PyTorch and same Device ---------------------------
+# Check which device model is on
+def _infer_device(agent: MAPPOAgent):
+    if torch is None:
+        raise RuntimeError("PyTorch is not available.")
+    return next(agent.parameters()).device
 
+
+# Converts data into PyTorch tensor and move to correct device
+def _to_torch(x, device, dtype=None):
+    if torch is None:
+        raise RuntimeError("PyTorch is not available.")
+    if torch.is_tensor(x):
+        tensor = x.to(device)
+    else:
+        tensor = torch.as_tensor(x, device=device)
+    if dtype is not None:
+        tensor = tensor.to(dtype=dtype)
+    return tensor
+# ---------------------------------------------------------------------------------------------------------------------
+
+# Standardize Advantage Values
+def _normalize_advantages(advantages: torch.Tensor) -> torch.Tensor:
+    if advantages.numel() <= 1:
+        return advantages
+    return (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1.0e-8)
+
+# Extracts parts needed in PPO from Model
+def _extract_eval_logprob_entropy(eval_out):
+    if isinstance(eval_out, tuple):
+        if len(eval_out) < 2:
+            raise ValueError("agent.evaluate_actions(...) must return at least (log_probs, entropy).")
+        return eval_out[0], eval_out[1]
+    raise ValueError("agent.evaluate_actions(...) should return a tuple like (log_probs, entropy).")
+
+
+# ----------------------------------- Actual PPO Learning -------------------------------------------------
+def ppo_update(agent: MAPPOAgent, buffer: RolloutBuffer, cfg: TrainConfig) -> Dict[str, float]:
+    """
+    PPO / MAPPO inner learning loop.
+
+    Assumes:
+    - buffer.get_training_batches(cfg.minibatch_size) yields dict minibatches
+    - agent.evaluate_actions(obs, action_masks, actions) -> (log_probs, entropy)
+    - agent.get_value(states) -> values
+    """
+
+    # Initial Checks
+    if torch is None:
+        raise RuntimeError("PyTorch is not available.")
+    if not hasattr(buffer, "get_training_batches"):
+        raise AttributeError("Buffer must provide get_training_batches(minibatch_size).")
+
+    # get model's device
+    device = _infer_device(agent)
+
+    # Metrics List - collect results over epochs and minibatches
+    policy_losses = []
+    value_losses = []
+    entropies = []
+    total_losses = []
+    ratio_means = []
+
+    # PPO Epoch Loop - reuse same rollout
+    for _ in range(cfg.ppo_epochs):
+
+        # Minibatch Loop - split rollout into minibatches
+        for batch in buffer.get_training_batches(cfg.minibatch_size):
+            # Inputs
+            obs = _to_torch(batch["obs"], device, torch.float32)
+            states = _to_torch(batch["states"], device, torch.float32)
+            actions = _to_torch(batch["actions"], device, torch.long).view(-1)
+            old_log_probs = _to_torch(batch["old_log_probs"], device, torch.float32).view(-1)
+            returns = _to_torch(batch["returns"], device, torch.float32).view(-1)
+            advantages = _to_torch(batch["advantages"], device, torch.float32).view(-1)
+            action_masks = _to_torch(batch["action_masks"], device, torch.float32)
+
+            # Optional Advantage Normalization - improve stability
+            if getattr(cfg, "normalize_advantages", False):
+                advantages = _normalize_advantages(advantages)
+
+            # Recompute current policy quantities
+            eval_out = agent.evaluate_actions(obs, action_masks, actions)
+            new_log_probs, entropy = _extract_eval_logprob_entropy(eval_out)
+            new_log_probs = new_log_probs.view(-1)
+            entropy = entropy.view(-1)
+
+            # Recompute current critic values
+            values = agent.get_value(states).view(-1)
+
+            ratio = torch.exp(new_log_probs - old_log_probs) # PPO ratio (how much action probability changed)
+            # Compute surrogate terms
+            surr1 = ratio * advantages # unclipped
+            surr2 = torch.clamp(ratio, 1.0 - cfg.clip_ratio, 1.0 + cfg.clip_ratio) * advantages # clipped
+
+
+            policy_loss = -torch.min(surr1, surr2).mean() # actor loss (to update action probabilities)
+            value_loss = ((values - returns) ** 2).mean() # value loss (critic)
+            entropy_mean = entropy.mean() # Entropy: exploration bonus
+
+            # Combine Actor Loss + Critic Loss - entropy Bonus
+            total_loss = policy_loss + cfg.value_coef * value_loss - cfg.entropy_coef * entropy_mean
+
+            # Clears old Gradients before Backpropagation
+            agent.actor_opt.zero_grad()
+            agent.critic_opt.zero_grad()
+
+            total_loss.backward() # Backward Pass
+
+            # Gradient Clipping
+            torch.nn.utils.clip_grad_norm_(agent.actor.parameters(), cfg.max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(agent.critic.parameters(), cfg.max_grad_norm)
+
+            # Optimizer (updates weights)
+            agent.actor_opt.step()
+            agent.critic_opt.step()
+
+            # Store Metrics
+            policy_losses.append(float(policy_loss.item()))
+            value_losses.append(float(value_loss.item()))
+            entropies.append(float(entropy_mean.item()))
+            total_losses.append(float(total_loss.item()))
+            ratio_means.append(float(ratio.mean().item()))
+
+    if not policy_losses:
+        return {
+            "policy_loss": 0.0,
+            "value_loss": 0.0,
+            "critic_loss": 0.0,
+            "entropy": 0.0,
+            "total_loss": 0.0,
+            "ratio_mean": 0.0,
+        }
+
+    return {
+        "policy_loss": float(np.mean(policy_losses)),
+        "value_loss": float(np.mean(value_losses)),
+        "critic_loss": float(np.mean(value_losses)),
+        "entropy": float(np.mean(entropies)),
+        "total_loss": float(np.mean(total_losses)),
+        "ratio_mean": float(np.mean(ratio_means)),
+    }
 
 # ============================================================
 # SECTION J - EVALUATION
@@ -839,20 +978,168 @@ def evaluate(env: ConstructionSchedulingEnv, agent, episodes: int, seed: int):
 # SECTION K - FULL TRAINING LOOP (PERSON 3)
 # ============================================================
 
-def train(cfg: TrainConfig) -> str:
-    """Main future training loop.
+# CSV Header String
+def _build_history_header() -> str:
+    return "episode,reward,length,success,critic_loss,policy_loss,entropy,total_loss\n"
 
-    Suggested order:
-    1. build env
-    2. reset to infer obs/state dims
-    3. build MAPPOAgent
-    4. optional behavior cloning warm start
-    5. collect rollout(s)
-    6. compute returns/advantages
-    7. PPO update
-    8. logging + checkpointing + evaluation
+# Extract Episode-Level Metrics from rollout
+def _extract_episode_metrics(rollout, buffer) -> Dict[str, float]:
+    reward = float("nan")
+    length = float("nan")
+    success = float("nan")
+
+    if isinstance(rollout, dict):
+        if "rewards" in rollout:
+            reward = float(np.sum(np.asarray(rollout["rewards"], dtype=np.float32)))
+            length = int(len(rollout["rewards"]))
+        if "infos" in rollout and rollout["infos"]:
+            success = float(rollout["infos"][-1].get("success", np.nan))
+    else:
+        rewards = getattr(buffer, "rewards", None)
+        if rewards is not None and len(rewards) > 0:
+            reward = float(np.sum(np.asarray(rewards, dtype=np.float32)))
+            length = int(len(rewards))
+
+    return {"reward": reward, "length": length, "success": success}
+
+# Save Model
+def _save_if_possible(agent, path: str, cfg: TrainConfig) -> None:
+    try:
+        agent.save(path, cfg)
+    except NotImplementedError:
+        print(f"skip save: agent.save(...) not implemented yet for {path}")
+
+# Training Loop
+def train(cfg: TrainConfig) -> str:
     """
-    raise NotImplementedError("TODO [PERSON 3]: implement full train loop")
+    Person 3 training-loop integration.
+
+    Expected external dependencies:
+    - collect_episode(...) implemented by Person 2 / shared work
+    - RolloutBuffer.compute_returns_and_advantages(...)
+    - RolloutBuffer.get_training_batches(...)
+    - MAPPOAgent.evaluate_actions(...)
+    - MAPPOAgent.save(...)
+    """
+
+    # Check PyTorch available
+    if torch is None:
+        raise RuntimeError("PyTorch is not available.")
+
+    # Create RNG (randomness)
+    rng = np.random.default_rng(cfg.seed)
+
+    # Build Environment from ConstructionSchedulingEnv
+    env = ConstructionSchedulingEnv(
+        grid_shape=(cfg.grid_rows, cfg.grid_cols),
+        num_robots=cfg.robots,
+        heavy_ratio=cfg.heavy_ratio,
+        max_steps=cfg.max_steps,
+        travel_speed_cells_per_step=cfg.travel_speed_cells_per_step,
+        travel_reward_weight=cfg.travel_reward_weight,
+        seed=cfg.seed,
+    )
+
+    # Reset once to infer Dimensions
+    obs, state = env.reset()
+
+    # Build Agent from MAPPOAgent
+    agent = MAPPOAgent(obs.shape[1], state.shape[0], env.action_size, cfg)
+
+    # Create log file: logging progress every episode
+    os.makedirs(cfg.save_dir, exist_ok=True)
+    history_path = os.path.join(cfg.save_dir, "training_log.csv")
+    with open(history_path, "w", encoding="utf-8") as f:
+        f.write(_build_history_header())
+
+    # Optional: Behaviour Cloning Warm Start
+    if cfg.bc_episodes > 0:
+        try:
+            pretrain_actor_with_greedy(env, agent, cfg.bc_episodes, rng)
+        except NotImplementedError:
+            print("skip BC warm start: pretrain_actor_with_greedy(...) not implemented yet")
+
+    # Model Save Path
+    model_path = os.path.join(cfg.save_dir, cfg.model_name)
+    best_success = -float("inf")
+
+    # Main Episode Loop
+    for episode_id in range(1, cfg.episodes + 1):
+        rollout = collect_episode(env, agent, rng, greedy=False) # collect rollout
+
+        if isinstance(rollout, RolloutBuffer):
+            buffer = rollout
+        elif isinstance(rollout, dict) and "buffer" in rollout:
+            buffer = rollout["buffer"]
+        else:
+            raise NotImplementedError(
+                "collect_episode(...) must return either a RolloutBuffer "
+                "or a dict containing {'buffer': rollout_buffer, ...}."
+            )
+
+        if not hasattr(buffer, "compute_returns_and_advantages"):
+            raise AttributeError("RolloutBuffer must implement compute_returns_and_advantages(...).")
+
+        # Compute Returns and Advantages
+        buffer.compute_returns_and_advantages(
+            last_value=0.0,
+            gamma=cfg.gamma,
+            gae_lambda=cfg.gae_lambda,
+            use_gae=cfg.use_gae,
+        )
+
+        update_metrics = ppo_update(agent, buffer, cfg) # Run PPO update
+        ep_metrics = _extract_episode_metrics(rollout, buffer) # Extract Episode Metrics
+
+        # Write CSV
+        with open(history_path, "a", encoding="utf-8") as f:
+            f.write(
+                f"{episode_id},"
+                f"{ep_metrics['reward']:.6f},"
+                f"{int(ep_metrics['length']) if ep_metrics['length'] == ep_metrics['length'] else -1},"
+                f"{ep_metrics['success']:.6f},"
+                f"{update_metrics['critic_loss']:.6f},"
+                f"{update_metrics['policy_loss']:.6f},"
+                f"{update_metrics['entropy']:.6f},"
+                f"{update_metrics['total_loss']:.6f}\n"
+
+            )
+
+        if cfg.plot_interval > 0 and (episode_id == 1 or episode_id % cfg.plot_interval == 0):
+            update_training_curve_plot(history_path, cfg.plot_path) # refresh plot periodically
+
+        # Print Episode Summary
+        print(
+            f"ep {episode_id:04d} | "
+            f"reward {ep_metrics['reward']:.2f} | "
+            f"len {int(ep_metrics['length']) if ep_metrics['length'] == ep_metrics['length'] else -1} | "
+            f"success {ep_metrics['success']:.2f} | "
+            f"policy {update_metrics['policy_loss']:.4f} | "
+            f"value {update_metrics['value_loss']:.4f} | "
+            f"entropy {update_metrics['entropy']:.4f}"
+        )
+
+        # Save Best Model
+        if ep_metrics["success"] == ep_metrics["success"] and ep_metrics["success"] > best_success:
+            best_success = ep_metrics["success"]
+            _save_if_possible(agent, model_path, cfg)
+
+        # Evaluate every interval
+        if cfg.eval_interval > 0 and episode_id % cfg.eval_interval == 0:
+            try:
+                metrics = evaluate(env, agent, episodes=cfg.eval_episodes, seed=cfg.seed + episode_id)
+                print(
+                    f"eval @ {episode_id:04d} | "
+                    f"success {metrics.get('success_rate', float('nan')):.3f}"
+                )
+            except NotImplementedError:
+                print("skip evaluation: evaluate(...) not implemented yet")
+
+    # Save Final Model
+    final_path = os.path.join(cfg.save_dir, "final_" + cfg.model_name)
+    _save_if_possible(agent, final_path, cfg)
+    update_training_curve_plot(history_path, cfg.plot_path)
+    return model_path
 
 
 # ============================================================
