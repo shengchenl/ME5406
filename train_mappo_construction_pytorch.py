@@ -59,7 +59,7 @@ class TrainConfig:
     grid_cols: int = 10
     robots: int = 6
     heavy_ratio: float = 0.25
-    max_steps: int = 200
+    max_steps: int = 900
     travel_speed_cells_per_step: float = 3.0
     travel_reward_weight: float = 0.01
 
@@ -86,13 +86,13 @@ class TrainConfig:
     # PPO / MAPPO
     gamma: float = 0.97
     gae_lambda: float = 0.95
-    actor_lr: float = 3.0e-4
-    critic_lr: float = 1.0e-3
+    actor_lr: float = 1.0e-4
+    critic_lr: float = 5.0e-4
     clip_ratio: float = 0.2
-    entropy_coef: float = 0.01
+    entropy_coef: float = 0.001
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
-    ppo_epochs: int = 4
+    ppo_epochs: int = 6
     minibatch_size: int = 256
 
     # toggles
@@ -517,22 +517,57 @@ def greedy_baseline_action(env: ConstructionSchedulingEnv) -> np.ndarray:
     return actions
 
 # Returns safer joint action for all robots
-def policy_guided_safe_action(env: ConstructionSchedulingEnv, agent, observations: np.ndarray, masks: np.ndarray) -> np.ndarray:
-    #Feasible decoding helper used mainly in evaluation.
-    # Changed to PyTorch ver
+def policy_guided_safe_action(
+    env: ConstructionSchedulingEnv,
+    agent,
+    observations: np.ndarray,
+    masks: np.ndarray,
+) -> np.ndarray:
+    """
+    Sequential coordination-aware decoder:
+    - actor is queried robot-by-robot with augmented observations
+    - actor probabilities guide the joint decision
+    - feasibility / coordination heuristics still refine the final assignment
+    """
+    if torch is None or not hasattr(agent, "actor") or not isinstance(getattr(agent, "actor"), nn.Module):
+        raise NotImplementedError("policy_guided_safe_action(...) requires a PyTorch actor.")
 
-    if torch is not None and hasattr(agent, "actor") and isinstance(getattr(agent, "actor"), nn.Module):
-        device = next(agent.actor.parameters()).device
-        obs_t = torch.as_tensor(observations, dtype=torch.float32, device=device)
-        mask_t = torch.as_tensor(masks, dtype=torch.float32, device=device)
-        with torch.no_grad():
-            logits_t = agent.actor(obs_t)
-            masked_logits_t = logits_t.masked_fill(mask_t < 0.5, -1.0e9)
-            probs = torch.softmax(masked_logits_t, dim=-1).cpu().numpy()
-    else:
-        raise NotImplementedError(
-            "policy_guided_safe_action(...) requires a PyTorch actor."
+    device = next(agent.actor.parameters()).device
+
+    selected_count = np.zeros(env.num_modules, dtype=np.float32)
+    heavy_pending = np.zeros(env.num_modules, dtype=np.float32)
+
+    prob_rows = []
+    aug_masks = []
+
+    # First pass: query actor sequentially with augmented inputs
+    for rid in range(env.num_robots):
+        coord_context = build_coord_context(env, selected_count, heavy_pending, rid)
+        obs_r = np.concatenate([observations[rid], coord_context]).astype(np.float32)
+
+        mask_r = build_sequential_mask(
+            env,
+            masks[rid],
+            selected_count,
+            heavy_pending,
         )
+
+        obs_r_t = torch.from_numpy(obs_r).float().unsqueeze(0).to(device)
+        mask_r_t = torch.from_numpy(mask_r).float().unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            logits_t = agent.actor(obs_r_t)
+            masked_logits_t = logits_t.masked_fill(mask_r_t < 0.5, -1.0e9)
+            probs_r = torch.softmax(masked_logits_t, dim=-1).squeeze(0).cpu().numpy()
+
+        prob_rows.append(probs_r)
+        aug_masks.append(mask_r)
+
+        greedy_action = int(np.argmax(probs_r))
+        update_coord_state(env, greedy_action, selected_count, heavy_pending)
+
+    probs = np.stack(prob_rows, axis=0)
+    aug_masks = np.stack(aug_masks, axis=0)
 
     actions = np.ones(env.num_robots, dtype=np.int64) * env.wait_action
 
@@ -545,12 +580,12 @@ def policy_guided_safe_action(env: ConstructionSchedulingEnv, agent, observation
     heavy_available = [
         int(module)
         for module in np.where((available > 0.5) & (env.heavy_mask > 0.5))[0]
-        if masks[idle, module].max(initial=0.0) > 0.5
+        if aug_masks[idle, module].max(initial=0.0) > 0.5
     ]
     normal_available = [
         int(module)
         for module in np.where((available > 0.5) & (env.heavy_mask < 0.5))[0]
-        if masks[idle, module].max(initial=0.0) > 0.5
+        if aug_masks[idle, module].max(initial=0.0) > 0.5
     ]
 
     remaining_idle = set(idle)
@@ -605,30 +640,64 @@ def policy_guided_safe_action(env: ConstructionSchedulingEnv, agent, observation
 
 
 # raw-policy HELPER
-def raw_policy_action(env: ConstructionSchedulingEnv, agent, observations: np.ndarray, masks: np.ndarray) -> np.ndarray:
-    """Use the actor directly with greedy masked argmax, no safe decoder."""
+def raw_policy_action(
+    env: ConstructionSchedulingEnv,
+    agent,
+    observations: np.ndarray,
+    masks: np.ndarray,
+) -> np.ndarray:
+    """
+    Sequential greedy actor execution using the same coordination-aware
+    observation format as training.
+    """
     if torch is None or not hasattr(agent, "actor") or not isinstance(getattr(agent, "actor"), nn.Module):
         raise NotImplementedError("raw_policy_action(...) requires a PyTorch actor.")
 
     device = next(agent.actor.parameters()).device
-    obs_t = torch.as_tensor(observations, dtype=torch.float32, device=device)
-    mask_t = torch.as_tensor(masks, dtype=torch.float32, device=device)
 
-    with torch.no_grad():
-        logits_t = agent.actor(obs_t)
-        masked_logits_t = logits_t.masked_fill(mask_t < 0.5, -1.0e9)
-        actions_t = torch.argmax(masked_logits_t, dim=-1)
+    selected_count = np.zeros(env.num_modules, dtype=np.float32)
+    heavy_pending = np.zeros(env.num_modules, dtype=np.float32)
 
-    return actions_t.cpu().numpy()
+    actions_np = np.ones(env.num_robots, dtype=np.int64) * env.wait_action
+
+    for rid in range(env.num_robots):
+        coord_context = build_coord_context(env, selected_count, heavy_pending, rid)
+        obs_r = np.concatenate([observations[rid], coord_context]).astype(np.float32)
+
+        mask_r = build_sequential_mask(
+            env,
+            masks[rid],
+            selected_count,
+            heavy_pending,
+        )
+
+        obs_r_t = torch.from_numpy(obs_r).float().unsqueeze(0).to(device)
+        mask_r_t = torch.from_numpy(mask_r).float().unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            action_r_t, _, _ = agent.get_action_and_logprob(
+                obs_r_t,
+                mask_r_t,
+                greedy=True,
+            )
+
+        action_r = int(action_r_t.item())
+        actions_np[rid] = action_r
+
+        update_coord_state(env, action_r, selected_count, heavy_pending)
+
+    return actions_np
 
 
-def pretrain_actor_with_greedy(env: ConstructionSchedulingEnv, agent, episodes: int, cfg: TrainConfig | None = None) -> None:
-    """Behavior cloning warm start.
-
-    STATUS:
-    - Collect expert actions from the greedy baseline.
-    - Train the PyTorch actor with supervised cross-entropy.
-    - This gives PPO a feasible initial policy before policy-gradient updates.
+def pretrain_actor_with_greedy(
+    env: ConstructionSchedulingEnv,
+    agent,
+    episodes: int,
+    cfg: TrainConfig | None = None,
+) -> None:
+    """
+    Behavior cloning using the same sequential coordination-aware actor input
+    that PPO will later use.
     """
     if episodes <= 0:
         return
@@ -637,8 +706,6 @@ def pretrain_actor_with_greedy(env: ConstructionSchedulingEnv, agent, episodes: 
     if not hasattr(agent, "actor") or not isinstance(getattr(agent, "actor"), nn.Module):
         raise NotImplementedError("Behavior cloning warm start requires the PyTorch MAPPOAgent.")
 
-    # BC Hyperparameters
-    # Use TrainConfig when available; otherwise fall back to conservative defaults.
     bc_epochs = cfg.bc_epochs if cfg is not None else 10
     bc_batch_size = cfg.bc_batch_size if cfg is not None else 256
     max_steps = cfg.max_steps if cfg is not None else env.max_steps
@@ -648,20 +715,34 @@ def pretrain_actor_with_greedy(env: ConstructionSchedulingEnv, agent, episodes: 
     mask_samples = []
     action_samples = []
 
-    # Expert Data Collection
-    # The greedy scheduler knows the environment state directly and provides a
-    # feasible joint action. Each robot contributes one supervised sample.
     for _ in range(episodes):
         obs, _ = env.reset()
         done = False
         step_count = 0
+
         while not done and step_count < max_steps:
-            masks = env.action_mask()
+            base_masks = env.action_mask()
             expert_actions = greedy_baseline_action(env)
 
-            obs_samples.append(obs.astype(np.float32))
-            mask_samples.append(masks.astype(np.float32))
-            action_samples.append(expert_actions.astype(np.int64))
+            selected_count = np.zeros(env.num_modules, dtype=np.float32)
+            heavy_pending = np.zeros(env.num_modules, dtype=np.float32)
+
+            for rid in range(env.num_robots):
+                coord_context = build_coord_context(env, selected_count, heavy_pending, rid)
+                obs_r = np.concatenate([obs[rid], coord_context]).astype(np.float32)
+
+                mask_r = build_sequential_mask(
+                    env,
+                    base_masks[rid],
+                    selected_count,
+                    heavy_pending,
+                )
+
+                obs_samples.append(obs_r)
+                mask_samples.append(mask_r)
+                action_samples.append(int(expert_actions[rid]))
+
+                update_coord_state(env, int(expert_actions[rid]), selected_count, heavy_pending)
 
             obs, _, _, done, _ = env.step(expert_actions)
             step_count += 1
@@ -669,32 +750,103 @@ def pretrain_actor_with_greedy(env: ConstructionSchedulingEnv, agent, episodes: 
     if not obs_samples:
         return
 
-    # Flatten Episode Data
-    # Shapes become [samples * robots, ...], matching the shared actor format.
-    obs_tensor = torch.as_tensor(np.asarray(obs_samples, dtype=np.float32), device=device).view(-1, obs_samples[0].shape[-1])
-    mask_tensor = torch.as_tensor(np.asarray(mask_samples, dtype=np.float32), device=device).view(-1, mask_samples[0].shape[-1])
-    action_tensor = torch.as_tensor(np.asarray(action_samples, dtype=np.int64), device=device).view(-1)
+    obs_tensor = torch.as_tensor(np.asarray(obs_samples, dtype=np.float32), device=device)
+    mask_tensor = torch.as_tensor(np.asarray(mask_samples, dtype=np.float32), device=device)
+    action_tensor = torch.as_tensor(np.asarray(action_samples, dtype=np.int64), device=device)
 
-    # Supervised Actor Training
-    # Masked logits prevent the cloning loss from assigning probability to
-    # unavailable actions.
     total_samples = obs_tensor.shape[0]
     for epoch in range(1, bc_epochs + 1):
         indices = torch.randperm(total_samples, device=device)
         losses = []
+
         for start in range(0, total_samples, bc_batch_size):
             batch_idx = indices[start:start + bc_batch_size]
+
             logits = agent.actor(obs_tensor[batch_idx])
             masked_logits = logits.masked_fill(mask_tensor[batch_idx] < 0.5, -1.0e9)
             loss = F.cross_entropy(masked_logits, action_tensor[batch_idx])
 
             agent.actor_opt.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(agent.actor.parameters(), cfg.max_grad_norm if cfg is not None else 0.5)
+            torch.nn.utils.clip_grad_norm_(
+                agent.actor.parameters(),
+                cfg.max_grad_norm if cfg is not None else 0.5,
+            )
             agent.actor_opt.step()
             losses.append(float(loss.item()))
 
-        print(f"bc epoch {epoch:03d}/{bc_epochs:03d} | loss {float(np.mean(losses)):.4f} | samples {total_samples}")
+        print(
+            f"bc epoch {epoch:03d}/{bc_epochs:03d} | "
+            f"loss {float(np.mean(losses)):.4f} | samples {total_samples}"
+        )
+
+def build_coord_context(
+    env,
+    selected_count: np.ndarray,
+    heavy_pending: np.ndarray,
+    robot_order: int,
+) -> np.ndarray:
+    """
+    Richer coordination context for sequential actor selection.
+
+    Components:
+    - available_now: which modules are dependency-available right now
+    - heavy_mask: which modules are heavy
+    - selected_count: how many times each module has already been chosen this timestep
+    - heavy_pending: heavy module already has 1 robot and is waiting for 2nd
+    - robot_busy: which robots are currently busy
+    - crane_free: whether crane is available right now
+    - order_scalar: normalized robot selection order in this timestep
+    """
+    available_now = env.dependency_mask().astype(np.float32)                  # [M]
+    heavy_mask = env.heavy_mask.astype(np.float32)                            # [M]
+    selected_count_norm = np.clip(selected_count.astype(np.float32), 0.0, 2.0) / 2.0  # [M]
+    heavy_pending = heavy_pending.astype(np.float32)                          # [M]
+    robot_busy = (env.robot_remaining_time > 0).astype(np.float32)           # [num_robots]
+    crane_free = np.array([1.0 if env.crane_cooldown == 0 else 0.0], dtype=np.float32)  # [1]
+    order_scalar = np.array([robot_order / max(1, env.num_robots - 1)], dtype=np.float32)  # [1]
+
+    return np.concatenate([
+        available_now,
+        heavy_mask,
+        selected_count_norm,
+        heavy_pending,
+        robot_busy,
+        crane_free,
+        order_scalar,
+    ]).astype(np.float32)
+
+
+def build_sequential_mask(env, base_mask_row: np.ndarray, selected_count: np.ndarray, heavy_pending: np.ndarray) -> np.ndarray:
+    mask = base_mask_row.copy()
+
+    for m in range(env.num_modules):
+        if env.heavy_mask[m] < 0.5:
+            if selected_count[m] >= 1:
+                mask[m] = 0.0
+        else:
+            if heavy_pending[m] > 0.5:
+                mask[m] = 1.0
+            elif selected_count[m] >= 2:
+                mask[m] = 0.0
+
+    mask[env.wait_action] = 1.0
+    return mask.astype(np.float32)
+
+
+def update_coord_state(env, action: int, selected_count: np.ndarray, heavy_pending: np.ndarray) -> None:
+    if action == env.wait_action:
+        return
+    if action < 0 or action >= env.num_modules:
+        return
+
+    selected_count[action] += 1.0
+
+    if env.heavy_mask[action] > 0.5:
+        if selected_count[action] == 1:
+            heavy_pending[action] = 1.0
+        else:
+            heavy_pending[action] = 0.0
 
 
 # ============================================================
@@ -707,51 +859,89 @@ def pretrain_actor_with_greedy(env: ConstructionSchedulingEnv, agent, episodes: 
 # - action representation
 # - buffer fields and tensor shapes
 
-def collect_episode(env: ConstructionSchedulingEnv, agent: MAPPOAgent, buffer: RolloutBuffer, cfg: TrainConfig, greedy: bool = False):
+def collect_episode(
+    env: ConstructionSchedulingEnv,
+    agent: MAPPOAgent,
+    buffer: RolloutBuffer,
+    cfg: TrainConfig,
+    greedy: bool = False,
+):
     obs, state = env.reset()
     done = False
-    total_reward = 0
+    total_reward = 0.0
     step_count = 0
     episode_rewards = []
     infos = []
 
     while not done and step_count < cfg.max_steps:
-        # A. 获取动作掩码 (防止选到不可行的任务)
-        masks = env.action_mask() # [num_robots, action_dim]
-
-        # B. 构造全局状态
-        # state = obs.flatten() # 原写法: [num_robots * obs_dim]，会和 critic 的 state_dim 不匹配
-
-        # C. 将 numpy 转为 torch tensor，并移动到和 agent 一样的 device
         device = next(agent.parameters()).device
-        obs_t = torch.from_numpy(obs).float().to(device)
-        mask_t = torch.from_numpy(masks).float().to(device)
+        base_masks = env.action_mask()
+
+        selected_count = np.zeros(env.num_modules, dtype=np.float32)
+        heavy_pending = np.zeros(env.num_modules, dtype=np.float32)
+
+        actions_np = np.ones(env.num_robots, dtype=np.int64) * env.wait_action
+        log_probs_np = np.zeros(env.num_robots, dtype=np.float32)
+
+        actor_obs_rows = []
+        actor_mask_rows = []
+
         state_t = torch.from_numpy(state).float().to(device)
 
         with torch.no_grad():
-            # 拿到动作、动作的 log 概率
-            actions_t, log_probs_t, _ = agent.get_action_and_logprob(obs_t, mask_t, greedy=greedy)
-            # 拿到 Critic 对局势的评估值
             value_t = agent.get_value(state_t)
 
-        # D. 环境执行
-        actions_np = actions_t.cpu().numpy()
+            for rid in range(env.num_robots):
+                coord_context = build_coord_context(env, selected_count, heavy_pending, rid)
+                obs_r = np.concatenate([obs[rid], coord_context]).astype(np.float32)
+
+                mask_r = build_sequential_mask(
+                    env,
+                    base_masks[rid],
+                    selected_count,
+                    heavy_pending,
+                )
+
+                obs_r_t = torch.from_numpy(obs_r).float().unsqueeze(0).to(device)
+                mask_r_t = torch.from_numpy(mask_r).float().unsqueeze(0).to(device)
+
+                action_r_t, log_prob_r_t, _ = agent.get_action_and_logprob(
+                    obs_r_t,
+                    mask_r_t,
+                    greedy=greedy,
+                )
+
+                action_r = int(action_r_t.item())
+                log_prob_r = float(log_prob_r_t.item())
+
+                actions_np[rid] = action_r
+                log_probs_np[rid] = log_prob_r
+
+                actor_obs_rows.append(obs_r)
+                actor_mask_rows.append(mask_r)
+
+                update_coord_state(env, action_r, selected_count, heavy_pending)
+
+        actor_obs_arr = np.stack(actor_obs_rows, axis=0).astype(np.float32)
+        actor_masks_arr = np.stack(actor_mask_rows, axis=0).astype(np.float32)
+
         next_obs, next_state, reward, done, info = env.step(actions_np)
+
         buffer.add(
-            actor_obs=obs,
+            actor_obs=actor_obs_arr,
             critic_state=state,
             actions=actions_np,
             reward=float(reward),
             done=float(done),
-            action_masks=masks,
-            log_probs=log_probs_t.cpu().numpy(),
+            action_masks=actor_masks_arr,
+            log_probs=log_probs_np,
             value=float(value_t.item()),
         )
 
         obs = next_obs
         state = next_state
-        total_reward += reward
-        episode_rewards.append(reward)
+        total_reward += float(reward)
+        episode_rewards.append(float(reward))
         infos.append(info)
         step_count += 1
 
@@ -1098,7 +1288,11 @@ def train(cfg: TrainConfig) -> str:
     obs, state = env.reset()
 
     # Build Agent from MAPPOAgent
-    agent = MAPPOAgent(obs.shape[1], state.shape[0], env.action_size, cfg)
+    base_obs_dim = obs.shape[1]
+    coord_context_dim = 4 * env.num_modules + env.num_robots + 2
+    actor_input_dim = base_obs_dim + coord_context_dim
+
+    agent = MAPPOAgent(actor_input_dim, state.shape[0], env.action_size, cfg)
 
     # Create log file: logging progress every episode
     os.makedirs(cfg.save_dir, exist_ok=True)
@@ -1189,14 +1383,14 @@ def train(cfg: TrainConfig) -> str:
 
         # Evaluate every interval
         if cfg.eval_interval > 0 and episode_id % cfg.eval_interval == 0:
-            comparison = compare_three_policies(
+            compare_three_policies(
                 env,
                 agent,
                 episodes=cfg.eval_episodes,
-                seed=cfg.seed + episode_id,
+                seed=12345,
             )
 
-    compare_three_policies(env, agent, episodes=cfg.eval_episodes, seed=cfg.seed + 9999)
+    compare_three_policies(env, agent, episodes=cfg.eval_episodes, seed=12345)
 
     # Save Final Model
     final_path = os.path.join(cfg.save_dir, "final_" + cfg.model_name)
@@ -1221,7 +1415,7 @@ def main() -> None:
     parser.add_argument("--grid-rows", type=int, default=10)
     parser.add_argument("--grid-cols", type=int, default=10)
     parser.add_argument("--heavy-ratio", type=float, default=0.25)
-    parser.add_argument("--max-steps", type=int, default=200)
+    parser.add_argument("--max-steps", type=int, default=900)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--save-dir", type=str, default="construction_models")
     parser.add_argument("--plot-interval", type=int, default=10)
