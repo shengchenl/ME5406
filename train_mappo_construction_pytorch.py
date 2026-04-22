@@ -35,10 +35,12 @@ import numpy as np
 try:
     import torch
     import torch.nn as nn
+    import torch.nn.functional as F
     from torch.distributions import Categorical
 except Exception:
     torch = None
     nn = None
+    F = None
     Categorical = None
 
 from construction_scheduling_env import ConstructionSchedulingEnv
@@ -680,9 +682,20 @@ def policy_guided_safe_action(env: ConstructionSchedulingEnv, agent, observation
     if hasattr(agent, "actor") and isinstance(getattr(agent, "actor"), LegacyMLP):
         logits, _ = agent.actor.forward(observations)
         probs = masked_softmax(logits, masks)
+    elif torch is not None and hasattr(agent, "actor") and isinstance(getattr(agent, "actor"), nn.Module):
+        # PyTorch Policy Forward Pass
+        # Convert observations/masks to the same device as the actor, then
+        # compute masked probabilities without sampling.
+        device = next(agent.actor.parameters()).device
+        obs_t = torch.as_tensor(observations, dtype=torch.float32, device=device)
+        mask_t = torch.as_tensor(masks, dtype=torch.float32, device=device)
+        with torch.no_grad():
+            logits_t = agent.actor(obs_t)
+            masked_logits_t = logits_t.masked_fill(mask_t < 0.5, -1.0e9)
+            probs = torch.softmax(masked_logits_t, dim=-1).cpu().numpy()
     else:
         raise NotImplementedError(
-            "TODO: connect policy_guided_safe_action to the new torch actor if needed."
+            "policy_guided_safe_action(...) requires either LegacyMLP or a PyTorch actor."
         )
 
     actions = np.ones(env.num_robots, dtype=np.int64) * env.wait_action
@@ -755,18 +768,79 @@ def policy_guided_safe_action(env: ConstructionSchedulingEnv, agent, observation
     return actions
 
 
-def pretrain_actor_with_greedy(env: ConstructionSchedulingEnv, agent, episodes: int, rng: np.random.Generator) -> None:
+def pretrain_actor_with_greedy(env: ConstructionSchedulingEnv, agent, episodes: int, rng: np.random.Generator, cfg: TrainConfig | None = None) -> None:
     """Behavior cloning warm start.
 
     STATUS:
-    - KEEP IDEA for now.
-    - IMPLEMENTATION will likely need a PyTorch rewrite.
+    - Collect expert actions from the greedy baseline.
+    - Train the PyTorch actor with supervised cross-entropy.
+    - This gives PPO a feasible initial policy before policy-gradient updates.
     """
     if episodes <= 0:
         return
-    raise NotImplementedError(
-        "TODO: rewrite behavior cloning pretraining for the new torch actor if needed."
-    )
+    if torch is None or F is None:
+        raise RuntimeError("PyTorch is not available.")
+    if not hasattr(agent, "actor") or not isinstance(getattr(agent, "actor"), nn.Module):
+        raise NotImplementedError("Behavior cloning warm start requires the PyTorch MAPPOAgent.")
+
+    # BC Hyperparameters
+    # Use TrainConfig when available; otherwise fall back to conservative defaults.
+    bc_epochs = cfg.bc_epochs if cfg is not None else 10
+    bc_batch_size = cfg.bc_batch_size if cfg is not None else 256
+    max_steps = cfg.max_steps if cfg is not None else env.max_steps
+    device = next(agent.actor.parameters()).device
+
+    obs_samples = []
+    mask_samples = []
+    action_samples = []
+
+    # Expert Data Collection
+    # The greedy scheduler knows the environment state directly and provides a
+    # feasible joint action. Each robot contributes one supervised sample.
+    for _ in range(episodes):
+        obs, _ = env.reset()
+        done = False
+        step_count = 0
+        while not done and step_count < max_steps:
+            masks = env.action_mask()
+            expert_actions = greedy_baseline_action(env)
+
+            obs_samples.append(obs.astype(np.float32))
+            mask_samples.append(masks.astype(np.float32))
+            action_samples.append(expert_actions.astype(np.int64))
+
+            obs, _, _, done, _ = env.step(expert_actions)
+            step_count += 1
+
+    if not obs_samples:
+        return
+
+    # Flatten Episode Data
+    # Shapes become [samples * robots, ...], matching the shared actor format.
+    obs_tensor = torch.as_tensor(np.asarray(obs_samples, dtype=np.float32), device=device).view(-1, obs_samples[0].shape[-1])
+    mask_tensor = torch.as_tensor(np.asarray(mask_samples, dtype=np.float32), device=device).view(-1, mask_samples[0].shape[-1])
+    action_tensor = torch.as_tensor(np.asarray(action_samples, dtype=np.int64), device=device).view(-1)
+
+    # Supervised Actor Training
+    # Masked logits prevent the cloning loss from assigning probability to
+    # unavailable actions.
+    total_samples = obs_tensor.shape[0]
+    for epoch in range(1, bc_epochs + 1):
+        indices = torch.randperm(total_samples, device=device)
+        losses = []
+        for start in range(0, total_samples, bc_batch_size):
+            batch_idx = indices[start:start + bc_batch_size]
+            logits = agent.actor(obs_tensor[batch_idx])
+            masked_logits = logits.masked_fill(mask_tensor[batch_idx] < 0.5, -1.0e9)
+            loss = F.cross_entropy(masked_logits, action_tensor[batch_idx])
+
+            agent.actor_opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(agent.actor.parameters(), cfg.max_grad_norm if cfg is not None else 0.5)
+            agent.actor_opt.step()
+            losses.append(float(loss.item()))
+
+        print(f"bc epoch {epoch:03d}/{bc_epochs:03d} | loss {float(np.mean(losses)):.4f} | samples {total_samples}")
 
 
 # ============================================================
@@ -997,7 +1071,94 @@ def ppo_update(agent: MAPPOAgent, buffer: RolloutBuffer, cfg: TrainConfig) -> Di
 # ============================================================
 
 def evaluate(env: ConstructionSchedulingEnv, agent, episodes: int, seed: int):
-    raise NotImplementedError("TODO: reconnect evaluation to the new rollout / new agent")
+    """Run evaluation episodes without updating the policy.
+
+    Evaluation uses policy_guided_safe_action(...) instead of direct sampling so
+    independent robot preferences are decoded into a more feasible joint action.
+    """
+    if episodes <= 0:
+        return {
+            "success_rate": 0.0,
+            "mean_reward": 0.0,
+            "mean_length": 0.0,
+            "mean_completed": 0.0,
+        }
+
+    # Build Evaluation Environment
+    # Use a separate env so evaluation does not disturb the training episode.
+    eval_env = ConstructionSchedulingEnv(
+        grid_shape=env.grid_shape,
+        num_robots=env.num_robots,
+        heavy_ratio=env.heavy_ratio,
+        max_steps=env.max_steps,
+        dependency_prob=env.dependency_prob,
+        max_prerequisites=env.max_prerequisites,
+        normal_base_duration=env.normal_base_duration,
+        heavy_base_duration=env.heavy_base_duration,
+        delay_probability=env.delay_probability,
+        crane_cooldown_steps=env.crane_cooldown_steps,
+        travel_speed_cells_per_step=env.travel_speed_cells_per_step,
+        travel_reward_weight=env.travel_reward_weight,
+        seed=seed,
+    )
+
+    was_training = False
+    if torch is not None and hasattr(agent, "training"):
+        was_training = bool(agent.training)
+        agent.eval()
+
+    rewards = []
+    lengths = []
+    successes = []
+    completed_counts = []
+    stats_totals = {
+        "dependency_violations": [],
+        "task_conflicts": [],
+        "resource_conflicts": [],
+        "invalid_completed": [],
+        "busy_action_violations": [],
+    }
+
+    # Evaluation Episode Loop
+    for _ in range(episodes):
+        obs, _ = eval_env.reset()
+        done = False
+        episode_reward = 0.0
+        step_count = 0
+        last_info = {}
+        episode_stats = {key: 0.0 for key in stats_totals}
+
+        while not done and step_count < eval_env.max_steps:
+            masks = eval_env.action_mask()
+            actions = policy_guided_safe_action(eval_env, agent, obs, masks)
+            obs, _, reward, done, info = eval_env.step(actions)
+
+            episode_reward += float(reward)
+            step_count += 1
+            last_info = info
+            for key in episode_stats:
+                episode_stats[key] += float(info.get("stats", {}).get(key, 0.0))
+
+        rewards.append(episode_reward)
+        lengths.append(float(step_count))
+        successes.append(float(last_info.get("success", False)))
+        completed_counts.append(float(last_info.get("completed", 0)))
+        for key, value in episode_stats.items():
+            stats_totals[key].append(value)
+
+    if torch is not None and hasattr(agent, "train"):
+        agent.train(was_training)
+
+    # Aggregate Evaluation Metrics
+    metrics = {
+        "success_rate": float(np.mean(successes)),
+        "mean_reward": float(np.mean(rewards)),
+        "mean_length": float(np.mean(lengths)),
+        "mean_completed": float(np.mean(completed_counts)),
+    }
+    for key, values in stats_totals.items():
+        metrics[f"mean_{key}"] = float(np.mean(values))
+    return metrics
 
 
 # ============================================================
@@ -1081,7 +1242,7 @@ def train(cfg: TrainConfig) -> str:
     # Optional: Behaviour Cloning Warm Start
     if cfg.bc_episodes > 0:
         try:
-            pretrain_actor_with_greedy(env, agent, cfg.bc_episodes, rng)
+            pretrain_actor_with_greedy(env, agent, cfg.bc_episodes, rng, cfg)
         except NotImplementedError:
             print("skip BC warm start: pretrain_actor_with_greedy(...) not implemented yet")
 
@@ -1164,7 +1325,10 @@ def train(cfg: TrainConfig) -> str:
                 metrics = evaluate(env, agent, episodes=cfg.eval_episodes, seed=cfg.seed + episode_id)
                 print(
                     f"eval @ {episode_id:04d} | "
-                    f"success {metrics.get('success_rate', float('nan')):.3f}"
+                    f"success {metrics.get('success_rate', float('nan')):.3f} | "
+                    f"reward {metrics.get('mean_reward', float('nan')):.2f} | "
+                    f"len {metrics.get('mean_length', float('nan')):.1f} | "
+                    f"completed {metrics.get('mean_completed', float('nan')):.1f}"
                 )
             except NotImplementedError:
                 print("skip evaluation: evaluate(...) not implemented yet")
@@ -1185,6 +1349,9 @@ def main() -> None:
     parser.add_argument("--episodes", type=int, default=700)
     parser.add_argument("--bc-episodes", type=int, default=500)
     parser.add_argument("--bc-epochs", type=int, default=30)
+    parser.add_argument("--bc-batch-size", type=int, default=256)
+    parser.add_argument("--eval-interval", type=int, default=100)
+    parser.add_argument("--eval-episodes", type=int, default=20)
     parser.add_argument("--robots", type=int, default=6)
     parser.add_argument("--grid-rows", type=int, default=10)
     parser.add_argument("--grid-cols", type=int, default=10)
@@ -1202,6 +1369,9 @@ def main() -> None:
         episodes=args.episodes,
         bc_episodes=args.bc_episodes,
         bc_epochs=args.bc_epochs,
+        bc_batch_size=args.bc_batch_size,
+        eval_interval=args.eval_interval,
+        eval_episodes=args.eval_episodes,
         robots=args.robots,
         grid_rows=args.grid_rows,
         grid_cols=args.grid_cols,
