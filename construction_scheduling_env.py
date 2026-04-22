@@ -248,10 +248,10 @@ class ConstructionSchedulingEnv:
                     self.robot_status[rid] = 0.0
                 if self.heavy_mask[module] > 0.5:
                     stats.completed_heavy += 1
-                    reward += 3.0
+                    reward += 5.0
                 else:
                     stats.completed_normal += 1
-                    reward += 1.0
+                    reward += 2.0
         if self.last_completed_modules:
             self.completion_event_count += 1
             for module in self.last_completed_modules:
@@ -263,7 +263,7 @@ class ConstructionSchedulingEnv:
         actions = np.asarray(actions, dtype=np.int64).reshape(self.num_robots)
         self.steps += 1
         stats = StepStats()
-        reward = -0.05
+        reward = -0.10
         self.cooperation_requests[:] = 0.0
         self.last_started_module = self.wait_action
         reward += self._advance_active_tasks(stats)
@@ -274,10 +274,10 @@ class ConstructionSchedulingEnv:
         requested_by_module: Dict[int, List[int]] = {}
         for rid, action in enumerate(actions):
             if action == self.wait_action: continue
-            if self.robot_remaining_time[rid] > 0: stats.busy_action_violations += 1; reward -= 1.0; continue
-            if action < 0 or action >= self.num_modules: stats.dependency_violations += 1; reward -= 1.0; continue
-            if self.completed[action] > 0.5 or self.in_progress[action] > 0.5: stats.invalid_completed += 1; reward -= 1.0; continue
-            if available[action] < 0.5: stats.dependency_violations += 1; reward -= 1.0; continue
+            if self.robot_remaining_time[rid] > 0: stats.busy_action_violations += 1; reward -= 1.5; continue
+            if action < 0 or action >= self.num_modules: stats.dependency_violations += 1; reward -= 1.5; continue
+            if self.completed[action] > 0.5 or self.in_progress[action] > 0.5: stats.invalid_completed += 1; reward -= 1.5; continue
+            if available[action] < 0.5: stats.dependency_violations += 1; reward -= 1.5; continue
             requested_by_module.setdefault(int(action), []).append(rid)
 
         heavy_candidates, normal_candidates = [], []
@@ -286,12 +286,13 @@ class ConstructionSchedulingEnv:
             idle_robots = [rid for rid in robots if self.robot_remaining_time[rid] <= 0]
             if is_heavy:
                 if self.crane_cooldown > 0:
-                    stats.resource_conflicts += len(idle_robots); reward -= 1.0 * len(idle_robots); continue
+                    stats.resource_conflicts += len(idle_robots)
+                    reward -= 1.5 * len(idle_robots); continue
                 if len(idle_robots) >= 2: heavy_candidates.append((module, idle_robots[:2], True))
                 elif idle_robots: self.cooperation_requests[idle_robots[0]] = 1.0
             else:
                 if len(idle_robots) == 1: normal_candidates.append((module, idle_robots, False))
-                elif len(idle_robots) > 1: stats.task_conflicts += len(idle_robots); reward -= 2.0
+                elif len(idle_robots) > 1: stats.task_conflicts += len(idle_robots); reward -= 3.0
 
         start_candidates = list(normal_candidates)
         if self.crane_cooldown == 0 and heavy_candidates:
@@ -307,11 +308,13 @@ class ConstructionSchedulingEnv:
             self.robot_remaining_time[robots] = float(duration)
             self.robot_status[robots] = 2.0 if is_heavy else 1.0
             self.last_started_module = int(module)
-            if is_heavy: self.crane_cooldown = self.crane_cooldown_steps; stats.started_heavy += 1; reward += 0.2
-            else: stats.started_normal += 1; reward += 0.1
+            if is_heavy: self.crane_cooldown = self.crane_cooldown_steps; stats.started_heavy += 1; reward += 0.05
+            else: stats.started_normal += 1; reward += 0.02
 
         done = bool(np.all(self.completed > 0.5) or self.steps >= self.max_steps)
-        if np.all(self.completed > 0.5): reward += 20.0
+        if np.all(self.completed > 0.5):
+            reward += 20.0
+            reward += 10.0 * (1.0 - self.steps / float(self.max_steps))
         return self.get_observations(), self.get_global_state(), float(reward), done, {"stats": stats.__dict__, "completed": int(np.sum(self.completed)), "total_modules": self.num_modules, "success": bool(np.all(self.completed > 0.5))}
 
     def render_rgb(self, cell_size: int | None = None) -> np.ndarray:
