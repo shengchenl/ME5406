@@ -26,6 +26,7 @@ import csv
 import os
 from dataclasses import asdict, dataclass
 from typing import Dict, List, Tuple
+from itertools import product
 
 import numpy as np
 
@@ -69,9 +70,10 @@ class TrainConfig:
     eval_interval: int = 100
     eval_episodes: int = 20
     save_dir: str = "construction_models"
-    model_name: str = "construction_mappo_pt.pth"
+    model_name: str = "construction_mappo_best_raw_eval.pth"
     plot_interval: int = 10
     plot_path: str = "results/training_curves.png"
+    resume_path: str = ""
 
     # behavior cloning
     bc_episodes: int = 500
@@ -554,6 +556,40 @@ def greedy_baseline_action(env: ConstructionSchedulingEnv) -> np.ndarray:
                 break
     return actions
 
+
+def naive_greedy_baseline_action(env: ConstructionSchedulingEnv) -> np.ndarray:
+    """
+    Limited-knowledge naive baseline.
+
+    Rules it uses:
+    - only assign dependency-available tasks
+    - assign tasks in simple module-order to idle robots
+
+    Rules it does NOT use:
+    - no heavy vs normal distinction
+    - no explicit 'heavy requires 2 robots' rule
+    - no heavy-first priority rule
+    - no travel-cost calculation
+    - no robot-capability scoring
+    - no matching / pairing optimization
+    """
+
+    available = env.dependency_mask()
+    actions = np.ones(env.num_robots, dtype=np.int64) * env.wait_action
+
+    idle = [int(r) for r in np.where(env.robot_remaining_time <= 0)[0]]
+    if not idle:
+        return actions
+
+    available_modules = [int(m) for m in np.where(available > 0.5)[0]]
+
+    # Treat all available modules the same, without knowing heavy-task structure
+    for rid, module in zip(idle, available_modules):
+        actions[rid] = module
+
+    return actions
+
+
 # Returns safer joint action for all robots
 def policy_guided_safe_action(
     env: ConstructionSchedulingEnv,
@@ -572,9 +608,18 @@ def policy_guided_safe_action(
 
     device = next(agent.actor.parameters()).device
 
-    prob_weight = 2.0
-    dist_weight = 0.35
-    cap_weight = 0.35
+    # normal-task decoder weights
+    prob_weight = 2.5
+    dist_weight = 0.20
+    cap_weight = 0.20
+    urgency_weight = 0.25
+
+    # heavy-task decoder weights
+    heavy_prob_weight = 3.0
+    heavy_dist_weight = 0.15
+    heavy_cap_weight = 0.15
+    heavy_urgency_weight = 0.75
+    heavy_pair_urgency_weight = 1.0
 
     selected_count = np.zeros(env.num_modules, dtype=np.float32)
     heavy_pending = np.zeros(env.num_modules, dtype=np.float32)
@@ -615,6 +660,7 @@ def policy_guided_safe_action(
 
     available = env.dependency_mask()
     distances = env.robot_module_distances()
+    urgency = env.module_urgency_scores()
     idle = [int(rid) for rid in np.where(env.robot_remaining_time <= 0)[0]]
     if not idle:
         return actions
@@ -639,9 +685,10 @@ def policy_guided_safe_action(
             ranked = sorted(
                 remaining_idle,
                 key=lambda rid: (
-                    prob_weight * float(probs[rid, module])
-                    - cap_weight * float(env.robot_capabilities[rid, 1])
-                    - dist_weight * float(distances[rid, module]) / env.max_travel_distance
+                    heavy_prob_weight * float(probs[rid, module])
+                    + heavy_urgency_weight * float(urgency[module])
+                    - heavy_cap_weight * float(env.robot_capabilities[rid, 1])
+                    - heavy_dist_weight * float(distances[rid, module]) / env.max_travel_distance
                 ),
                 reverse=True,
             )
@@ -649,9 +696,10 @@ def policy_guided_safe_action(
                 continue
             pair = ranked[:2]
             score = (
-                prob_weight * float(probs[pair[0], module] + probs[pair[1], module])
-                - cap_weight * float(env.robot_capabilities[pair[0], 1] + env.robot_capabilities[pair[1], 1])
-                - dist_weight * float(distances[pair[0], module] + distances[pair[1], module]) / env.max_travel_distance
+                heavy_prob_weight * float(probs[pair[0], module] + probs[pair[1], module])
+                + heavy_pair_urgency_weight * float(urgency[module])
+                - heavy_cap_weight * float(env.robot_capabilities[pair[0], 1] + env.robot_capabilities[pair[1], 1])
+                - heavy_dist_weight * float(distances[pair[0], module] + distances[pair[1], module]) / env.max_travel_distance
             )
             if score > best_score:
                 best_score = score
@@ -662,26 +710,97 @@ def policy_guided_safe_action(
                 actions[rid] = module
                 remaining_idle.remove(rid)
 
-    normal_pairs = []
-    for rid in remaining_idle:
-        for module in normal_available:
-            score = (
-                prob_weight * float(probs[rid, module])
-                - cap_weight * float(env.robot_capabilities[rid, 0])
-                - dist_weight * float(distances[rid, module]) / env.max_travel_distance
-            )
-            normal_pairs.append((score, rid, module))
-    normal_pairs.sort(reverse=True)
 
-    used_modules = set()
-    for _, rid, module in normal_pairs:
-        if rid not in remaining_idle or module in used_modules:
+    # Try trusting the actor's raw normal-task choices first.
+    raw_normal_actions = {}
+    raw_normal_valid = True
+
+    for rid in list(remaining_idle):
+        raw_choice = int(np.argmax(probs[rid]))
+
+        if raw_choice == env.wait_action:
             continue
-        actions[rid] = module
-        remaining_idle.remove(rid)
-        used_modules.add(module)
-        if not remaining_idle:
+
+        if raw_choice not in normal_available:
+            raw_normal_valid = False
             break
+
+        if raw_choice in raw_normal_actions.values():
+            raw_normal_valid = False
+            break
+
+        raw_normal_actions[rid] = raw_choice
+
+
+    # -------- Better joint matching for normal tasks --------
+    # Instead of greedy pair picking, build top-k module options for each idle robot,
+    # then search over combinations and keep the best non-duplicate assignment.
+
+    if raw_normal_valid and raw_normal_actions:
+        for rid, module in raw_normal_actions.items():
+            actions[rid] = module
+            remaining_idle.remove(rid)
+    elif remaining_idle and normal_available:
+        top_k = 2
+        candidate_modules_by_robot = {}
+
+        for rid in remaining_idle:
+            scored_modules = []
+            for module in normal_available:
+                score = (
+                    prob_weight * float(probs[rid, module])
+                    + urgency_weight * float(urgency[module])
+                    - cap_weight * float(env.robot_capabilities[rid, 0])
+                    - dist_weight * float(distances[rid, module]) / env.max_travel_distance
+                )
+                scored_modules.append((score, module))
+
+            scored_modules.sort(reverse=True)
+            top_modules = [module for _, module in scored_modules[:top_k]]
+
+            # allow waiting as an option in the joint search
+            candidate_modules_by_robot[rid] = top_modules + [env.wait_action]
+
+        idle_list = sorted(list(remaining_idle))
+        option_lists = [candidate_modules_by_robot[rid] for rid in idle_list]
+
+        best_assignment = None
+        best_total_score = -np.inf
+
+        for assignment_tuple in product(*option_lists):
+            used_modules = set()
+            total_score = 0.0
+            valid = True
+
+            for rid, module in zip(idle_list, assignment_tuple):
+                if module == env.wait_action:
+                    # mild penalty for waiting so assignment prefers useful work
+                    total_score -= 1.0
+                    continue
+
+                if module in used_modules:
+                    valid = False
+                    break
+
+                used_modules.add(module)
+
+                score = (
+                    prob_weight * float(probs[rid, module])
+                    + urgency_weight * float(urgency[module])
+                    - cap_weight * float(env.robot_capabilities[rid, 0])
+                    - dist_weight * float(distances[rid, module]) / env.max_travel_distance
+                )
+                total_score += score
+
+            if valid and total_score > best_total_score:
+                best_total_score = total_score
+                best_assignment = assignment_tuple
+
+        if best_assignment is not None:
+            for rid, module in zip(idle_list, best_assignment):
+                if module != env.wait_action:
+                    actions[rid] = module
+                    remaining_idle.remove(rid)
 
     return actions
 
@@ -931,7 +1050,7 @@ def compute_actor_shaped_rewards(
 
         if action == env.wait_action:
             if np.any((available > 0.5) & (base_masks[rid, :env.num_modules] > 0.5)):
-                rewards[rid] -= 0.5
+                rewards[rid] -= 0.8
             else:
                 rewards[rid] += 0.05
             continue
@@ -951,7 +1070,7 @@ def compute_actor_shaped_rewards(
                 rewards[rid] -= 0.8
             else:
                 chosen_normal[action] = rid
-                rewards[rid] += 0.3
+                rewards[rid] += 0.45
         else:
             heavy_counts[action] = heavy_counts.get(action, 0) + 1
 
@@ -959,7 +1078,7 @@ def compute_actor_shaped_rewards(
         rids = np.where(actions_np == module)[0]
         if count == 2:
             for rid in rids:
-                rewards[rid] += 0.7
+                rewards[rid] += 1.0
         elif count == 1:
             for rid in rids:
                 rewards[rid] -= 0.5
@@ -1282,7 +1401,9 @@ def evaluate_with_mode(env: ConstructionSchedulingEnv, agent, episodes: int, see
         while not done and step_count < eval_env.max_steps:
             masks = eval_env.action_mask()
 
-            if mode == "greedy_baseline":
+            if mode == "naive_greedy":
+                actions = naive_greedy_baseline_action(eval_env)
+            elif mode == "greedy_baseline":
                 actions = greedy_baseline_action(eval_env)
             elif mode == "raw_policy":
                 actions = raw_policy_action(eval_env, agent, obs, masks)
@@ -1312,12 +1433,20 @@ def evaluate_with_mode(env: ConstructionSchedulingEnv, agent, episodes: int, see
     }
 
 # Comparison printer
-def compare_three_policies(env: ConstructionSchedulingEnv, agent, episodes: int, seed: int):
+
+def compare_four_policies(env: ConstructionSchedulingEnv, agent, episodes: int, seed: int):
+    naive_metrics = evaluate_with_mode(env, agent, episodes, seed, mode="naive_greedy")
     greedy_metrics = evaluate_with_mode(env, agent, episodes, seed, mode="greedy_baseline")
     raw_metrics = evaluate_with_mode(env, agent, episodes, seed, mode="raw_policy")
     safe_metrics = evaluate_with_mode(env, agent, episodes, seed, mode="safe_decoder")
 
     print("\n=== POLICY COMPARISON ===")
+    print(
+        f"0. Naive greedy         | success {naive_metrics['success_rate']:.3f} "
+        f"| reward {naive_metrics['mean_reward']:.2f} "
+        f"| length {naive_metrics['mean_length']:.1f} "
+        f"| completed {naive_metrics['mean_completed']:.1f}"
+    )
     print(
         f"A. Greedy baseline      | success {greedy_metrics['success_rate']:.3f} "
         f"| reward {greedy_metrics['mean_reward']:.2f} "
@@ -1338,6 +1467,7 @@ def compare_three_policies(env: ConstructionSchedulingEnv, agent, episodes: int,
     )
 
     return {
+        "naive_greedy": naive_metrics,
         "greedy_baseline": greedy_metrics,
         "raw_policy": raw_metrics,
         "safe_decoder": safe_metrics,
@@ -1415,21 +1545,24 @@ def train(cfg: TrainConfig) -> str:
 
     agent = MAPPOAgent(actor_input_dim, state.shape[0], env.action_size, cfg)
 
+    if cfg.resume_path:
+        agent.load(cfg.resume_path)
+        print(f"loaded checkpoint: {cfg.resume_path}")
+    elif cfg.bc_episodes > 0:
+        try:
+            pretrain_actor_with_greedy(env, agent, cfg.bc_episodes, cfg)
+        except NotImplementedError:
+            print("skip BC warm start: pretrain_actor_with_greedy(...) not implemented yet")
+
     # Create log file: logging progress every episode
     os.makedirs(cfg.save_dir, exist_ok=True)
     history_path = os.path.join(cfg.save_dir, "training_log.csv")
     with open(history_path, "w", encoding="utf-8") as f:
         f.write(_build_history_header())
 
-    # Optional: Behaviour Cloning Warm Start
-    if cfg.bc_episodes > 0:
-        try:
-            pretrain_actor_with_greedy(env, agent, cfg.bc_episodes, cfg)
-        except NotImplementedError:
-            print("skip BC warm start: pretrain_actor_with_greedy(...) not implemented yet")
-
     # Model Save Path
-    model_path = os.path.join(cfg.save_dir, cfg.model_name)
+    best_model_path = os.path.join(cfg.save_dir, cfg.model_name)
+    final_model_path = os.path.join(cfg.save_dir, "construction_mappo_final.pth")
     best_raw_eval_score = (-1.0, -1.0, -float("inf"))
 
     # Main Episode Loop
@@ -1499,7 +1632,7 @@ def train(cfg: TrainConfig) -> str:
 
         # Evaluate every interval
         if cfg.eval_interval > 0 and episode_id % cfg.eval_interval == 0:
-            comparison = compare_three_policies(
+            comparison = compare_four_policies(
                 env,
                 agent,
                 episodes=cfg.eval_episodes,
@@ -1523,7 +1656,7 @@ def train(cfg: TrainConfig) -> str:
 
             if candidate_score > best_raw_eval_score:
                 best_raw_eval_score = candidate_score
-                _save_if_possible(agent, model_path, cfg)
+                _save_if_possible(agent, best_model_path, cfg)
                 print(
                     f"saved new best raw-eval model at ep {episode_id} | "
                     f"success {raw_metrics['success_rate']:.3f} | "
@@ -1531,13 +1664,14 @@ def train(cfg: TrainConfig) -> str:
                     f"length {raw_metrics['mean_length']:.1f}"
                 )
 
-    compare_three_policies(env, agent, episodes=cfg.eval_episodes, seed=12345)
+    best_agent = MAPPOAgent(actor_input_dim, state.shape[0], env.action_size, cfg)
+    best_agent.load(best_model_path)
+    compare_four_policies(env, best_agent, episodes=cfg.eval_episodes, seed=12345)
 
     # Save Final Model
-    final_path = os.path.join(cfg.save_dir, "final_" + cfg.model_name)
-    _save_if_possible(agent, final_path, cfg)
+    _save_if_possible(agent, final_model_path, cfg)
     update_training_curve_plot(history_path, cfg.plot_path)
-    return model_path
+    return best_model_path
 
 
 # ============================================================
@@ -1563,6 +1697,7 @@ def main() -> None:
     parser.add_argument("--plot-path", type=str, default="results/training_curves.png")
     parser.add_argument("--travel-speed", type=float, default=3.0)
     parser.add_argument("--travel-reward-weight", type=float, default=0.01)
+    parser.add_argument("--resume-path", type=str, default="")
     args = parser.parse_args()
 
     cfg = TrainConfig(
@@ -1583,6 +1718,7 @@ def main() -> None:
         plot_path=args.plot_path,
         travel_speed_cells_per_step=args.travel_speed,
         travel_reward_weight=args.travel_reward_weight,
+        resume_path=args.resume_path,
     )
     model_path = train(cfg)
     print(f"saved model: {model_path}")
