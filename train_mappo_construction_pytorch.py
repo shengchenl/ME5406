@@ -1044,9 +1044,9 @@ def train(cfg: TrainConfig) -> str:
     # Check PyTorch available
     if torch is None:
         raise RuntimeError("PyTorch is not available.")
+    
+    torch.manual_seed(cfg.seed)
 
-    # Create RNG (randomness)
-    rng = np.random.default_rng(cfg.seed)
 
     # Build Environment from ConstructionSchedulingEnv
     env = ConstructionSchedulingEnv(
