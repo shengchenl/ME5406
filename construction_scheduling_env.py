@@ -15,9 +15,6 @@ import numpy as np
 import cv2
 
 
-WAIT_ACTION = -1
-
-
 @dataclass
 class StepStats:
     started_normal: int = 0
