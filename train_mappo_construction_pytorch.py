@@ -604,7 +604,7 @@ def policy_guided_safe_action(env: ConstructionSchedulingEnv, agent, observation
     return actions
 
 
-def pretrain_actor_with_greedy(env: ConstructionSchedulingEnv, agent, episodes: int, rng: np.random.Generator, cfg: TrainConfig | None = None) -> None:
+def pretrain_actor_with_greedy(env: ConstructionSchedulingEnv, agent, episodes: int, cfg: TrainConfig | None = None) -> None:
     """Behavior cloning warm start.
 
     STATUS:
@@ -1074,7 +1074,7 @@ def train(cfg: TrainConfig) -> str:
     # Optional: Behaviour Cloning Warm Start
     if cfg.bc_episodes > 0:
         try:
-            pretrain_actor_with_greedy(env, agent, cfg.bc_episodes, rng, cfg)
+            pretrain_actor_with_greedy(env, agent, cfg.bc_episodes, cfg)
         except NotImplementedError:
             print("skip BC warm start: pretrain_actor_with_greedy(...) not implemented yet")
 
