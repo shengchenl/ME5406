@@ -91,14 +91,14 @@ class ConstructionSchedulingEnv:
         self.module_completion_order = np.ones(self.num_modules, dtype=np.int32) * -1
         self.heavy_mask = np.zeros(self.num_modules, dtype=np.float32)
         self.module_owners = np.zeros((self.num_modules, self.num_robots), dtype=np.float32)
-        self.robot_task = np.ones(self.num_robots, dtype=np.int64) * WAIT_ACTION
+        self.robot_task = np.ones(self.num_robots, dtype=np.int64) * self.wait_action
         self.robot_remaining_time = np.zeros(self.num_robots, dtype=np.float32)
         self.robot_status = np.zeros(self.num_robots, dtype=np.float32)
         self.cooperation_requests = np.zeros(self.num_robots, dtype=np.float32)
         self.resource_occupied = 0.0
         self.crane_cooldown = 0
         self.steps = 0
-        self.last_started_module = WAIT_ACTION
+        self.last_started_module = self.wait_action
         self.last_completed_modules: List[int] = []
         self.completion_event_count = 0
 
@@ -181,7 +181,7 @@ class ConstructionSchedulingEnv:
         self.resource_occupied = 0.0
         self.crane_cooldown = 0
         self.steps = 0
-        self.last_started_module = WAIT_ACTION
+        self.last_started_module = self.wait_action
         self.last_completed_modules = []
         self.completion_event_count = 0
         return self.get_observations(), self.get_global_state()
