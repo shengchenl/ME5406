@@ -88,7 +88,7 @@ class TrainConfig:
     gae_lambda: float = 0.95
     actor_lr: float = 1.0e-4
     critic_lr: float = 5.0e-4
-    clip_ratio: float = 0.2
+    clip_ratio: float = 0.15
     entropy_coef: float = 0.001
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
@@ -271,6 +271,9 @@ class RolloutBuffer:
         self.actor_masks = []
         self.actor_log_probs = []
 
+        self.actor_rewards = []
+        self.actor_dones = []
+
         self.critic_states = []
         self.critic_rewards = []
         self.critic_dones = []
@@ -279,11 +282,25 @@ class RolloutBuffer:
         self.advantages = None
         self.returns = None
 
-    def add(self, actor_obs, critic_state, actions, reward, done, action_masks, log_probs, value) -> None:
+    def add(
+        self,
+        actor_obs,
+        critic_state,
+        actions,
+        reward,
+        done,
+        action_masks,
+        log_probs,
+        value,
+        actor_rewards,
+    ) -> None:
         self.actor_obs.append(actor_obs)
         self.actor_actions.append(actions)
         self.actor_masks.append(action_masks)
         self.actor_log_probs.append(log_probs)
+
+        self.actor_rewards.append(actor_rewards)
+        self.actor_dones.append(np.full_like(actor_rewards, done, dtype=np.float32))
 
         self.critic_states.append(critic_state)
         self.critic_rewards.append(reward)
@@ -317,9 +334,28 @@ class RolloutBuffer:
                 returns[t] = running_return
             advantages = returns - critic_values
 
-        num_robots = np.array(self.actor_actions).shape[1]
-        self.advantages = advantages.repeat_interleave(num_robots)
-        self.returns = returns.repeat_interleave(num_robots)
+        actor_rewards = torch.tensor(np.array(self.actor_rewards), dtype=torch.float32)   # [T, N]
+        actor_dones = torch.tensor(np.array(self.actor_dones), dtype=torch.float32)       # [T, N]
+
+        num_robots = actor_rewards.shape[1]
+
+        actor_advantages = torch.zeros_like(actor_rewards)
+        actor_returns = torch.zeros_like(actor_rewards)
+
+        for rid in range(num_robots):
+            running_return = torch.tensor(0.0, dtype=torch.float32)
+            for t in reversed(range(len(actor_rewards))):
+                running_return = actor_rewards[t, rid] + gamma * running_return * (1.0 - actor_dones[t, rid])
+                actor_returns[t, rid] = running_return
+
+        baseline_per_timestep = actor_returns.mean(dim=1, keepdim=True)
+        actor_advantages = actor_returns - baseline_per_timestep
+
+        self.advantages = actor_advantages.reshape(-1)
+        self.returns = actor_returns.reshape(-1)
+
+        self.critic_returns = returns
+        self.critic_advantages = advantages
 
     def get_training_batches(self, minibatch_size: int):
         """
@@ -342,6 +378,7 @@ class RolloutBuffer:
 
         advantages_f = self.advantages.view(-1)
         returns_f = self.returns.view(-1)
+        critic_returns = self.critic_returns.repeat_interleave(num_robots)
         # 注意：优势标准化放在 ppo_update(...) 中按 cfg.normalize_advantages 控制，
         # 这里保持原始 advantages，不重复标准化。
 
@@ -363,6 +400,7 @@ class RolloutBuffer:
                 "old_log_probs": log_probs_f[batch_idx],
                 "advantages": advantages_f[batch_idx],
                 "returns": returns_f[batch_idx],
+                "critic_returns": critic_returns[batch_idx],
                 "action_masks": masks_f[batch_idx],
             }
 
@@ -534,6 +572,10 @@ def policy_guided_safe_action(
 
     device = next(agent.actor.parameters()).device
 
+    prob_weight = 2.0
+    dist_weight = 0.35
+    cap_weight = 0.35
+
     selected_count = np.zeros(env.num_modules, dtype=np.float32)
     heavy_pending = np.zeros(env.num_modules, dtype=np.float32)
 
@@ -596,17 +638,21 @@ def policy_guided_safe_action(
         for module in heavy_available:
             ranked = sorted(
                 remaining_idle,
-                key=lambda rid: float(probs[rid, module])
-                / (
-                    max(0.25, float(env.robot_capabilities[rid, 1]))
-                    * (1.0 + float(distances[rid, module]) / env.max_travel_distance)
+                key=lambda rid: (
+                    prob_weight * float(probs[rid, module])
+                    - cap_weight * float(env.robot_capabilities[rid, 1])
+                    - dist_weight * float(distances[rid, module]) / env.max_travel_distance
                 ),
                 reverse=True,
             )
             if len(ranked) < 2:
                 continue
             pair = ranked[:2]
-            score = float(probs[pair[0], module] + probs[pair[1], module])
+            score = (
+                prob_weight * float(probs[pair[0], module] + probs[pair[1], module])
+                - cap_weight * float(env.robot_capabilities[pair[0], 1] + env.robot_capabilities[pair[1], 1])
+                - dist_weight * float(distances[pair[0], module] + distances[pair[1], module]) / env.max_travel_distance
+            )
             if score > best_score:
                 best_score = score
                 best_choice = (module, pair)
@@ -619,9 +665,10 @@ def policy_guided_safe_action(
     normal_pairs = []
     for rid in remaining_idle:
         for module in normal_available:
-            score = float(probs[rid, module]) / (
-                max(0.25, float(env.robot_capabilities[rid, 0]))
-                * (1.0 + float(distances[rid, module]) / env.max_travel_distance)
+            score = (
+                prob_weight * float(probs[rid, module])
+                - cap_weight * float(env.robot_capabilities[rid, 0])
+                - dist_weight * float(distances[rid, module]) / env.max_travel_distance
             )
             normal_pairs.append((score, rid, module))
     normal_pairs.sort(reverse=True)
@@ -859,6 +906,69 @@ def update_coord_state(env, action: int, selected_count: np.ndarray, heavy_pendi
 # - action representation
 # - buffer fields and tensor shapes
 
+def compute_actor_shaped_rewards(
+    env: ConstructionSchedulingEnv,
+    actions_np: np.ndarray,
+    base_masks: np.ndarray,
+    team_reward: float,
+) -> np.ndarray:
+    """
+    Per-robot shaped reward used for actor learning.
+    Critic still uses shared team reward.
+    """
+    rewards = np.full(env.num_robots, 0.15 * float(team_reward), dtype=np.float32)
+
+    available = env.dependency_mask()
+    idle = env.robot_remaining_time <= 0
+
+    chosen_normal = {}
+    heavy_counts = {}
+
+    for rid, action in enumerate(actions_np):
+        if not idle[rid]:
+            rewards[rid] += 0.0
+            continue
+
+        if action == env.wait_action:
+            if np.any((available > 0.5) & (base_masks[rid, :env.num_modules] > 0.5)):
+                rewards[rid] -= 0.5
+            else:
+                rewards[rid] += 0.05
+            continue
+
+        if action < 0 or action >= env.num_modules:
+            rewards[rid] -= 1.0
+            continue
+
+        if available[action] < 0.5:
+            rewards[rid] -= 1.0
+            continue
+
+        rewards[rid] += 0.4
+
+        if env.heavy_mask[action] < 0.5:
+            if action in chosen_normal:
+                rewards[rid] -= 0.8
+            else:
+                chosen_normal[action] = rid
+                rewards[rid] += 0.3
+        else:
+            heavy_counts[action] = heavy_counts.get(action, 0) + 1
+
+    for module, count in heavy_counts.items():
+        rids = np.where(actions_np == module)[0]
+        if count == 2:
+            for rid in rids:
+                rewards[rid] += 0.7
+        elif count == 1:
+            for rid in rids:
+                rewards[rid] -= 0.5
+        else:
+            for rid in rids:
+                rewards[rid] -= 0.8
+
+    return rewards
+
 def collect_episode(
     env: ConstructionSchedulingEnv,
     agent: MAPPOAgent,
@@ -925,7 +1035,16 @@ def collect_episode(
         actor_obs_arr = np.stack(actor_obs_rows, axis=0).astype(np.float32)
         actor_masks_arr = np.stack(actor_mask_rows, axis=0).astype(np.float32)
 
+        actor_rewards_np = compute_actor_shaped_rewards(
+            env,
+            actions_np,
+            base_masks,
+            0.0,
+        )
+
         next_obs, next_state, reward, done, info = env.step(actions_np)
+
+        actor_rewards_np = actor_rewards_np + 0.15 * float(reward)
 
         buffer.add(
             actor_obs=actor_obs_arr,
@@ -936,6 +1055,7 @@ def collect_episode(
             action_masks=actor_masks_arr,
             log_probs=log_probs_np,
             value=float(value_t.item()),
+            actor_rewards=actor_rewards_np,
         )
 
         obs = next_obs
@@ -1042,6 +1162,7 @@ def ppo_update(agent: MAPPOAgent, buffer: RolloutBuffer, cfg: TrainConfig) -> Di
             actions = _to_torch(batch["actions"], device, torch.long).view(-1)
             old_log_probs = _to_torch(batch["old_log_probs"], device, torch.float32).view(-1)
             returns = _to_torch(batch["returns"], device, torch.float32).view(-1)
+            critic_returns = _to_torch(batch["critic_returns"], device, torch.float32).view(-1)
             advantages = _to_torch(batch["advantages"], device, torch.float32).view(-1)
             action_masks = _to_torch(batch["action_masks"], device, torch.float32)
 
@@ -1065,7 +1186,7 @@ def ppo_update(agent: MAPPOAgent, buffer: RolloutBuffer, cfg: TrainConfig) -> Di
 
 
             policy_loss = -torch.min(surr1, surr2).mean() # actor loss (to update action probabilities)
-            value_loss = ((values - returns) ** 2).mean() # value loss (critic)
+            value_loss = ((values - critic_returns) ** 2).mean() # value loss (critic)
             entropy_mean = entropy.mean() # Entropy: exploration bonus
 
             # Combine Actor Loss + Critic Loss - entropy Bonus
@@ -1309,7 +1430,7 @@ def train(cfg: TrainConfig) -> str:
 
     # Model Save Path
     model_path = os.path.join(cfg.save_dir, cfg.model_name)
-    best_success = -float("inf")
+    best_raw_eval_score = (-1.0, -1.0, -float("inf"))
 
     # Main Episode Loop
     for episode_id in range(1, cfg.episodes + 1):
@@ -1376,19 +1497,39 @@ def train(cfg: TrainConfig) -> str:
             f"entropy {update_metrics['entropy']:.4f}"
         )
 
-        # Save Best Model
-        if ep_metrics["success"] == ep_metrics["success"] and ep_metrics["success"] > best_success:
-            best_success = ep_metrics["success"]
-            _save_if_possible(agent, model_path, cfg)
-
         # Evaluate every interval
         if cfg.eval_interval > 0 and episode_id % cfg.eval_interval == 0:
-            compare_three_policies(
+            comparison = compare_three_policies(
                 env,
                 agent,
                 episodes=cfg.eval_episodes,
                 seed=12345,
             )
+
+            raw_metrics = comparison["raw_policy"]
+
+            print(
+                f"[raw-eval-check] success={raw_metrics['success_rate']:.3f}, "
+                f"completed={raw_metrics['mean_completed']:.1f}, "
+                f"length={raw_metrics['mean_length']:.1f}, "
+                f"reward={raw_metrics['mean_reward']:.2f}"
+            )
+            
+            candidate_score = (
+                float(raw_metrics["success_rate"]),
+                float(raw_metrics["mean_completed"]),
+                -float(raw_metrics["mean_length"]),
+            )
+
+            if candidate_score > best_raw_eval_score:
+                best_raw_eval_score = candidate_score
+                _save_if_possible(agent, model_path, cfg)
+                print(
+                    f"saved new best raw-eval model at ep {episode_id} | "
+                    f"success {raw_metrics['success_rate']:.3f} | "
+                    f"completed {raw_metrics['mean_completed']:.1f} | "
+                    f"length {raw_metrics['mean_length']:.1f}"
+                )
 
     compare_three_policies(env, agent, episodes=cfg.eval_episodes, seed=12345)
 
