@@ -74,12 +74,12 @@ class ConstructionSchedulingEnv:
 
         # 高对比度机器人颜色 (BGR)
         self.DISTINCT_ROBOT_COLORS = [
-            (0, 0, 255),      # 红色
-            (255, 0, 0),      # 蓝色
-            (0, 255, 0),      # 绿色
-            (0, 165, 255),    # 橙色
-            (204, 0, 204),    # 紫色
-            (0, 255, 255),    # 黄色
+            (0, 0, 255),      # red
+            (255, 0, 0),      # blue
+            (0, 255, 0),      # green
+            (0, 165, 255),    # orange
+            (204, 0, 204),    # purple
+            (0, 255, 255),    # yellow
         ]
 
         self.max_travel_distance = float(max(1.0, sum(self.grid_shape)))
@@ -226,6 +226,10 @@ class ConstructionSchedulingEnv:
         stochastic_delay = int(self.rng.random() < self.delay_probability)
         return max(1, travel_time + int(np.ceil(base * multiplier)) + stochastic_delay)
 
+    def _capability_score(self, robots: List[int], is_heavy: bool) -> float:
+        col = 1 if is_heavy else 0
+        return float(np.mean(self.robot_capabilities[robots, col]))
+
     def _advance_active_tasks(self, stats: StepStats) -> float:
         reward = 0.0
         self.last_completed_modules = []
@@ -273,11 +277,24 @@ class ConstructionSchedulingEnv:
         available = self.dependency_mask()
         requested_by_module: Dict[int, List[int]] = {}
         for rid, action in enumerate(actions):
-            if action == self.wait_action: continue
-            if self.robot_remaining_time[rid] > 0: stats.busy_action_violations += 1; reward -= 1.5; continue
-            if action < 0 or action >= self.num_modules: stats.dependency_violations += 1; reward -= 1.5; continue
-            if self.completed[action] > 0.5 or self.in_progress[action] > 0.5: stats.invalid_completed += 1; reward -= 1.5; continue
-            if available[action] < 0.5: stats.dependency_violations += 1; reward -= 1.5; continue
+            if action == self.wait_action:
+                continue
+            if self.robot_remaining_time[rid] > 0:
+                stats.busy_action_violations += 1
+                reward -= 1.5
+                continue
+            if action < 0 or action >= self.num_modules:
+                stats.dependency_violations += 1
+                reward -= 1.5
+                continue
+            if self.completed[action] > 0.5 or self.in_progress[action] > 0.5:
+                stats.invalid_completed += 1
+                reward -= 1.5
+                continue
+            if available[action] < 0.5:
+                stats.dependency_violations += 1
+                reward -= 1.5
+                continue
             requested_by_module.setdefault(int(action), []).append(rid)
 
         heavy_candidates, normal_candidates = [], []
@@ -287,20 +304,33 @@ class ConstructionSchedulingEnv:
             if is_heavy:
                 if self.crane_cooldown > 0:
                     stats.resource_conflicts += len(idle_robots)
-                    reward -= 1.5 * len(idle_robots); continue
-                if len(idle_robots) >= 2: heavy_candidates.append((module, idle_robots[:2], True))
-                elif idle_robots: self.cooperation_requests[idle_robots[0]] = 1.0
+                    reward -= 1.5 * len(idle_robots)
+                    continue
+                if len(idle_robots) >= 2:
+                    heavy_candidates.append((module, idle_robots[:2], True))
+                elif idle_robots:
+                    self.cooperation_requests[idle_robots[0]] = 1.0
+                    reward -= 0.20
             else:
-                if len(idle_robots) == 1: normal_candidates.append((module, idle_robots, False))
-                elif len(idle_robots) > 1: stats.task_conflicts += len(idle_robots); reward -= 3.0
+                if len(idle_robots) == 1:
+                    normal_candidates.append((module, idle_robots, False))
+                elif len(idle_robots) > 1:
+                    stats.task_conflicts += len(idle_robots)
+                    reward -= 3.0
 
         start_candidates = list(normal_candidates)
         if self.crane_cooldown == 0 and heavy_candidates:
-            heavy_candidates.sort(key=lambda x: x[0]); start_candidates.append(heavy_candidates[0])
+            heavy_candidates.sort(key=lambda x: x[0])
+            start_candidates.append(heavy_candidates[0])
+
+        distances_now = self.robot_module_distances()
 
         for module, robots, is_heavy in sorted(start_candidates, key=lambda x: x[0]):
             duration = self._duration_for(module, robots, is_heavy)
-            stats.travel_distance += float(np.sum(self.robot_module_distances()[robots, module]))
+            travel_distance = float(np.sum(distances_now[robots, module]))
+            capability_score = self._capability_score(robots, is_heavy)
+
+            stats.travel_distance += travel_distance
             self.in_progress[module] = 1.0
             self.remaining_module_time[module] = float(duration)
             self.module_owners[module, robots] = 1.0
@@ -308,14 +338,36 @@ class ConstructionSchedulingEnv:
             self.robot_remaining_time[robots] = float(duration)
             self.robot_status[robots] = 2.0 if is_heavy else 1.0
             self.last_started_module = int(module)
-            if is_heavy: self.crane_cooldown = self.crane_cooldown_steps; stats.started_heavy += 1; reward += 0.05
-            else: stats.started_normal += 1; reward += 0.02
+
+            # --- reward tuning: 在原有奖励上做小幅增量修改，不改环境主逻辑 ---
+            travel_penalty = self.travel_reward_weight * (travel_distance / float(max(1, len(robots))))
+            duration_penalty = 0.015 * float(duration)
+            capability_bonus = 0.12 * float(capability_score - 1.0)
+
+            reward -= travel_penalty
+            reward -= duration_penalty
+            reward += capability_bonus
+
+            if is_heavy:
+                self.crane_cooldown = self.crane_cooldown_steps
+                stats.started_heavy += 1
+                reward += 0.08
+                if len(robots) == 2:
+                    reward += 0.10
+            else:
+                stats.started_normal += 1
+                reward += 0.03
 
         done = bool(np.all(self.completed > 0.5) or self.steps >= self.max_steps)
         if np.all(self.completed > 0.5):
             reward += 20.0
             reward += 10.0 * (1.0 - self.steps / float(self.max_steps))
-        return self.get_observations(), self.get_global_state(), float(reward), done, {"stats": stats.__dict__, "completed": int(np.sum(self.completed)), "total_modules": self.num_modules, "success": bool(np.all(self.completed > 0.5))}
+        return self.get_observations(), self.get_global_state(), float(reward), done, {
+            "stats": stats.__dict__,
+            "completed": int(np.sum(self.completed)),
+            "total_modules": self.num_modules,
+            "success": bool(np.all(self.completed > 0.5)),
+        }
 
     def render_rgb(self, cell_size: int | None = None) -> np.ndarray:
         rows, cols = self.grid_shape
@@ -359,14 +411,14 @@ class ConstructionSchedulingEnv:
                 curr_y = int(base_y + offset_radius * np.sin(angle))
                 curr_x = int(base_x + offset_radius * np.cos(angle))
 
-                # 绘制箭头
+                # Draw Arrows
                 prev_pos = self.last_robot_positions[rid]
                 if tuple(prev_pos.astype(int)) != (gr, gc):
                     prev_y = int(header + prev_pos[0] * cell_size + cell_size // 2)
                     prev_x = int(prev_pos[1] * cell_size + cell_size // 2)
                     cv2.arrowedLine(image, (prev_x, prev_y), (curr_x, curr_y), color, 2, tipLength=0.25)
 
-                # 绘制机器人圆点
+                # Draw dots
                 cv2.circle(image, (curr_x, curr_y), int(cell_size * 0.18), color, -1, cv2.LINE_AA)
                 cv2.circle(image, (curr_x, curr_y), int(cell_size * 0.18), (255, 255, 255), 1, cv2.LINE_AA)
                 cv2.putText(image, str(rid), (curr_x - 4, curr_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
