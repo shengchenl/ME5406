@@ -47,111 +47,6 @@ from construction_scheduling_env import ConstructionSchedulingEnv
 
 
 # ============================================================
-# SECTION A - SMALL HELPERS WE CAN KEEP
-# ============================================================
-
-def masked_softmax(logits: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """NumPy masked softmax.
-
-    STATUS:
-    - KEEP FOR NOW for legacy/reference code and debugging.
-    - The full PyTorch version should have a torch equivalent.
-    """
-    masked = logits.copy()
-    masked[mask < 0.5] = -1.0e9
-    masked -= np.max(masked, axis=-1, keepdims=True)
-    exp = np.exp(masked) * mask
-    total = np.sum(exp, axis=-1, keepdims=True)
-    return exp / np.maximum(total, 1.0e-8)
-
-
-# ============================================================
-# SECTION B - LEGACY OPTIMIZER / NETWORKS (REFERENCE ONLY)
-# ============================================================
-
-class Adam:
-    """Handwritten Adam optimizer from the current file.
-
-    STATUS:
-    - FUNCTIONALLY FINE as a real Adam implementation.
-    - KEEP AS REFERENCE ONLY.
-    - FULL PYTORCH VERSION should use torch.optim.Adam instead.
-    """
-
-    def __init__(
-        self,
-        lr: float = 3.0e-4,
-        beta1: float = 0.9,
-        beta2: float = 0.999,
-        eps: float = 1.0e-8,
-    ):
-        self.lr = lr
-        self.beta1 = beta1
-        self.beta2 = beta2
-        self.eps = eps
-        self.t = 0
-        self.m: List[np.ndarray] = []
-        self.v: List[np.ndarray] = []
-
-    def step(self, params: List[np.ndarray], grads: List[np.ndarray]) -> None:
-        if not self.m:
-            self.m = [np.zeros_like(p) for p in params]
-            self.v = [np.zeros_like(p) for p in params]
-        self.t += 1
-        for i, (p, g) in enumerate(zip(params, grads)):
-            self.m[i] = self.beta1 * self.m[i] + (1.0 - self.beta1) * g
-            self.v[i] = self.beta2 * self.v[i] + (1.0 - self.beta2) * (g * g)
-            m_hat = self.m[i] / (1.0 - self.beta1**self.t)
-            v_hat = self.v[i] / (1.0 - self.beta2**self.t)
-            p -= self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
-
-
-class LegacyMLP:
-    """Current NumPy MLP from the draft trainer.
-
-    STATUS:
-    - VALID MLP, but not the final version we want.
-    - KEEP AS REFERENCE for architecture / dimensions / debugging.
-    - REPLACE LATER with PyTorch Actor/Critic modules.
-    """
-
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dims: Tuple[int, ...],
-        output_dim: int,
-        rng: np.random.Generator,
-    ):
-        dims = (input_dim,) + hidden_dims + (output_dim,)
-        self.weights: List[np.ndarray] = []
-        self.biases: List[np.ndarray] = []
-        for fan_in, fan_out in zip(dims[:-1], dims[1:]):
-            limit = np.sqrt(6.0 / float(fan_in + fan_out))
-            self.weights.append(
-                rng.uniform(-limit, limit, size=(fan_in, fan_out)).astype(np.float32)
-            )
-            self.biases.append(np.zeros(fan_out, dtype=np.float32))
-
-    def params(self) -> List[np.ndarray]:
-        params: List[np.ndarray] = []
-        for weight, bias in zip(self.weights, self.biases):
-            params.extend([weight, bias])
-        return params
-
-    def forward(self, x: np.ndarray):
-        h = x.astype(np.float32)
-        caches: List[Tuple[np.ndarray, np.ndarray]] = []
-        for layer, (weight, bias) in enumerate(zip(self.weights, self.biases)):
-            z = h @ weight + bias
-            caches.append((h, z))
-            if layer < len(self.weights) - 1:
-                h = np.tanh(z)
-            else:
-                h = z
-        return h, caches
-
-
-# ============================================================
 # SECTION C - TRAIN CONFIG
 # ============================================================
 
@@ -204,44 +99,6 @@ class TrainConfig:
     use_gae: bool = True
     normalize_advantages: bool = True
     use_torch: bool = True
-
-
-# ============================================================
-# SECTION D - LEGACY AGENT (REFERENCE ONLY)
-# ============================================================
-
-class LegacySharedActorCentralCritic:
-    """Current NumPy shared actor + centralized critic.
-
-    STATUS:
-    - MAIN THING TO REPLACE.
-    - KEEP here so the team can compare old vs new structure.
-    """
-
-    def __init__(
-        self,
-        obs_dim: int,
-        state_dim: int,
-        action_dim: int,
-        rng: np.random.Generator,
-        cfg: TrainConfig,
-    ):
-        self.action_dim = action_dim
-        self.actor = LegacyMLP(obs_dim, cfg.actor_hidden_sizes, action_dim, rng)
-        self.critic = LegacyMLP(state_dim, cfg.critic_hidden_sizes, 1, rng)
-        self.actor_opt = Adam(cfg.actor_lr)
-        self.critic_opt = Adam(cfg.critic_lr)
-
-    def act(self, observations: np.ndarray, masks: np.ndarray, rng: np.random.Generator, greedy: bool = False):
-        logits, _ = self.actor.forward(observations)
-        probs = masked_softmax(logits, masks)
-        actions = []
-        log_probs = []
-        for prob in probs:
-            action = int(np.argmax(prob)) if greedy else int(rng.choice(len(prob), p=prob))
-            actions.append(action)
-            log_probs.append(float(np.log(max(prob[action], 1.0e-8))))
-        return np.asarray(actions, dtype=np.int64), probs, np.asarray(log_probs, dtype=np.float32)
 
 
 # ============================================================
@@ -394,20 +251,6 @@ class MAPPOAgent(nn.Module if nn is not None else object):
 # SECTION F - RETURNS / GAE / DATA SIDE (PERSON 2)
 # ============================================================
 
-def discounted_returns(rewards: List[float], gamma: float) -> np.ndarray:
-    """Legacy Monte Carlo discounted returns.
-
-    STATUS:
-    - KEEP FOR REFERENCE / fallback.
-    - FULL MAPPO should prefer GAE + bootstrapped values.
-    """
-    out = np.zeros(len(rewards), dtype=np.float32)
-    running = 0.0
-    for t in reversed(range(len(rewards))):
-        running = rewards[t] + gamma * running
-        out[t] = running
-    return out
-
 
 # TODO [PERSON 2]
 # 1. Define rollout buffer fields
@@ -423,83 +266,84 @@ class RolloutBuffer:
         self.clear()
 
     def clear(self) -> None:
-        self.obs = []
-        self.states = []
-        self.actions = []
-        self.rewards = []
-        self.dones = []
-        self.action_masks = []
-        self.log_probs = []
-        self.values = []
+        self.actor_obs = []
+        self.actor_actions = []
+        self.actor_masks = []
+        self.actor_log_probs = []
 
-    def add(self, obs, states, actions, rewards, dones, action_masks, log_probs, values) -> None:
-        self.obs.append(obs)
-        self.states.append(states)
-        self.actions.append(actions)
-        self.rewards.append(rewards)
-        self.dones.append(dones)
-        self.action_masks.append(action_masks)
-        self.log_probs.append(log_probs)
-        self.values.append(values)
+        self.critic_states = []
+        self.critic_rewards = []
+        self.critic_dones = []
+        self.critic_values = []
+
+        self.advantages = None
+        self.returns = None
+
+    def add(self, actor_obs, critic_state, actions, reward, done, action_masks, log_probs, value) -> None:
+        self.actor_obs.append(actor_obs)
+        self.actor_actions.append(actions)
+        self.actor_masks.append(action_masks)
+        self.actor_log_probs.append(log_probs)
+
+        self.critic_states.append(critic_state)
+        self.critic_rewards.append(reward)
+        self.critic_dones.append(done)
+        self.critic_values.append(value) 
 
     def compute_returns_and_advantages(self, last_value, gamma: float, gae_lambda: float, use_gae: bool = True):
         # 将列表转换为 Tensor
-        rewards = torch.tensor(np.array(self.rewards), dtype=torch.float32)  # [T, N]
-        values = torch.tensor(np.array(self.values), dtype=torch.float32)  # [T, N]
-        dones = torch.tensor(np.array(self.dones), dtype=torch.float32)  # [T, N]
-        last_value = torch.as_tensor(last_value, dtype=torch.float32)
-        if last_value.ndim == 0:
-            last_value = last_value.repeat(values.shape[1])
+        critic_rewards = torch.tensor(np.array(self.critic_rewards), dtype=torch.float32)   # [T]
+        critic_values = torch.tensor(np.array(self.critic_values), dtype=torch.float32)     # [T]
+        critic_dones = torch.tensor(np.array(self.critic_dones), dtype=torch.float32)       # [T]
+
+        last_value = torch.as_tensor(last_value, dtype=torch.float32).view(())
 
         if use_gae:
-            # 扩展 values 数组以包含 last_value (即 V_next)
-            # 结果维度: [T+1, N]
-            v_next_all = torch.cat([values[1:], last_value.unsqueeze(0)], dim=0)
+            next_values = torch.cat([critic_values[1:], last_value.unsqueeze(0)], dim=0)
+            advantages = torch.zeros_like(critic_rewards)
+            last_gae = torch.tensor(0.0, dtype=torch.float32)
 
-            self.advantages = torch.zeros_like(rewards)
-            last_gae = torch.zeros(values.shape[1], dtype=torch.float32)
+            for t in reversed(range(len(critic_rewards))):
+                delta = critic_rewards[t] + gamma * next_values[t] * (1.0 - critic_dones[t]) - critic_values[t]
+                last_gae = delta + gamma * gae_lambda * (1.0 - critic_dones[t]) * last_gae
+                advantages[t] = last_gae
 
-            # 倒序遍历计算 GAE
-            for t in reversed(range(len(rewards))):
-                # TD Error: delta = r + gamma * V_next * (1-done) - V_now
-                delta = rewards[t] + gamma * v_next_all[t] * (1.0 - dones[t]) - values[t]
-                # GAE: A_t = delta + gamma * lambda * (1-done) * A_{t+1}
-                last_gae = delta + gamma * gae_lambda * (1.0 - dones[t]) * last_gae
-                self.advantages[t] = last_gae
-
-            # Returns = Advantage + Value (作为 Critic 的更新目标)
-            self.returns = self.advantages + values
+            returns = advantages + critic_values
         else:
-            returns = torch.zeros_like(rewards)
+            returns = torch.zeros_like(critic_rewards)
             running_return = last_value
-            for t in reversed(range(len(rewards))):
-                running_return = rewards[t] + gamma * running_return * (1.0 - dones[t])
+            for t in reversed(range(len(critic_rewards))):
+                running_return = critic_rewards[t] + gamma * running_return * (1.0 - critic_dones[t])
                 returns[t] = running_return
-            self.returns = returns
-            self.advantages = self.returns - values
+            advantages = returns - critic_values
+
+        num_robots = np.array(self.actor_actions).shape[1]
+        self.advantages = advantages.repeat_interleave(num_robots)
+        self.returns = returns.repeat_interleave(num_robots)
 
     def get_training_batches(self, minibatch_size: int):
         """
         一次性处理所有数据，并以列表形式返回所有训练批次。
         """
 
-        def flatten_to_tensor(data_list, dtype=torch.float32):
-            arr = np.array(data_list)
+        def flatten_actor_tensor(data_list, dtype=torch.float32):
+            arr = np.array(data_list)          # [T, N, ...]
             t = torch.tensor(arr, dtype=dtype)
-            return t.view(-1, *t.shape[2:])
+            return t.view(-1, *t.shape[2:])    # [T*N, ...]
 
-        # 1. 准备大表 (Flattened Tensors)
-        obs_f = flatten_to_tensor(self.obs)
-        states_f = flatten_to_tensor(self.states)
-        actions_f = flatten_to_tensor(self.actions, dtype=torch.long)
-        log_probs_f = flatten_to_tensor(self.log_probs)
-        masks_f = flatten_to_tensor(self.action_masks)
+        obs_f = flatten_actor_tensor(self.actor_obs)
+        actions_f = flatten_actor_tensor(self.actor_actions, dtype=torch.long)
+        log_probs_f = flatten_actor_tensor(self.actor_log_probs)
+        masks_f = flatten_actor_tensor(self.actor_masks)
 
-        # 处理优势和回报
+        critic_states = torch.tensor(np.array(self.critic_states), dtype=torch.float32)  # [T, state_dim]
+        num_robots = np.array(self.actor_actions).shape[1]
+        states_f = critic_states.repeat_interleave(num_robots, dim=0)                    # [T*N, state_dim]
+
         advantages_f = self.advantages.view(-1)
         returns_f = self.returns.view(-1)
-        # 标准化优势函数
-        advantages_f = (advantages_f - advantages_f.mean()) / (advantages_f.std() + 1e-8)
+        # 注意：优势标准化放在 ppo_update(...) 中按 cfg.normalize_advantages 控制，
+        # 这里保持原始 advantages，不重复标准化。
 
         # 2. 随机洗牌
         total_samples = obs_f.size(0)
@@ -672,20 +516,12 @@ def greedy_baseline_action(env: ConstructionSchedulingEnv) -> np.ndarray:
                 break
     return actions
 
-
+# Returns safer joint action for all robots
 def policy_guided_safe_action(env: ConstructionSchedulingEnv, agent, observations: np.ndarray, masks: np.ndarray) -> np.ndarray:
-    """Feasible decoding helper used mainly in evaluation.
+    #Feasible decoding helper used mainly in evaluation.
+    # Changed to PyTorch ver
 
-    STATUS:
-    - KEEP FOR NOW unless later the team redesigns it.
-    """
-    if hasattr(agent, "actor") and isinstance(getattr(agent, "actor"), LegacyMLP):
-        logits, _ = agent.actor.forward(observations)
-        probs = masked_softmax(logits, masks)
-    elif torch is not None and hasattr(agent, "actor") and isinstance(getattr(agent, "actor"), nn.Module):
-        # PyTorch Policy Forward Pass
-        # Convert observations/masks to the same device as the actor, then
-        # compute masked probabilities without sampling.
+    if torch is not None and hasattr(agent, "actor") and isinstance(getattr(agent, "actor"), nn.Module):
         device = next(agent.actor.parameters()).device
         obs_t = torch.as_tensor(observations, dtype=torch.float32, device=device)
         mask_t = torch.as_tensor(masks, dtype=torch.float32, device=device)
@@ -695,7 +531,7 @@ def policy_guided_safe_action(env: ConstructionSchedulingEnv, agent, observation
             probs = torch.softmax(masked_logits_t, dim=-1).cpu().numpy()
     else:
         raise NotImplementedError(
-            "policy_guided_safe_action(...) requires either LegacyMLP or a PyTorch actor."
+            "policy_guided_safe_action(...) requires a PyTorch actor."
         )
 
     actions = np.ones(env.num_robots, dtype=np.int64) * env.wait_action
@@ -853,7 +689,7 @@ def pretrain_actor_with_greedy(env: ConstructionSchedulingEnv, agent, episodes: 
 # - action representation
 # - buffer fields and tensor shapes
 
-def collect_episode(env: ConstructionSchedulingEnv, agent: MAPPOAgent, buffer: RolloutBuffer, cfg: TrainConfig, rng: np.random.Generator, greedy: bool = False):
+def collect_episode(env: ConstructionSchedulingEnv, agent: MAPPOAgent, buffer: RolloutBuffer, cfg: TrainConfig, greedy: bool = False):
     obs, state = env.reset()
     done = False
     total_reward = 0
@@ -868,10 +704,11 @@ def collect_episode(env: ConstructionSchedulingEnv, agent: MAPPOAgent, buffer: R
         # B. 构造全局状态
         # state = obs.flatten() # 原写法: [num_robots * obs_dim]，会和 critic 的 state_dim 不匹配
 
-        # C. 将 numpy 转为 torch tensor
-        obs_t = torch.from_numpy(obs).float()
-        mask_t = torch.from_numpy(masks).float()
-        state_t = torch.from_numpy(state).float()
+        # C. 将 numpy 转为 torch tensor，并移动到和 agent 一样的 device
+        device = next(agent.parameters()).device
+        obs_t = torch.from_numpy(obs).float().to(device)
+        mask_t = torch.from_numpy(masks).float().to(device)
+        state_t = torch.from_numpy(state).float().to(device)
 
         with torch.no_grad():
             # 拿到动作、动作的 log 概率
@@ -883,14 +720,14 @@ def collect_episode(env: ConstructionSchedulingEnv, agent: MAPPOAgent, buffer: R
         actions_np = actions_t.cpu().numpy()
         next_obs, next_state, reward, done, info = env.step(actions_np)
         buffer.add(
-            obs=obs,
-            states=np.repeat(state[None, :], env.num_robots, axis=0),
+            actor_obs=obs,
+            critic_state=state,
             actions=actions_np,
-            rewards=np.full(env.num_robots, reward, dtype=np.float32),
-            dones=np.full(env.num_robots, done, dtype=np.float32), # 记录每个机器人对应的结束标志
+            reward=float(reward),
+            done=float(done),
             action_masks=masks,
             log_probs=log_probs_t.cpu().numpy(),
-            values=np.full(env.num_robots, float(value_t.item()), dtype=np.float32)
+            value=float(value_t.item()),
         )
 
         obs = next_obs
@@ -1181,11 +1018,6 @@ def _extract_episode_metrics(rollout, buffer) -> Dict[str, float]:
             length = int(len(rollout["rewards"]))
         if "infos" in rollout and rollout["infos"]:
             success = float(rollout["infos"][-1].get("success", np.nan))
-    else:
-        rewards = getattr(buffer, "rewards", None)
-        if rewards is not None and len(rewards) > 0:
-            reward = float(np.sum(np.asarray(rewards, dtype=np.float32)))
-            length = int(len(rewards))
 
     return {"reward": reward, "length": length, "success": success}
 
@@ -1253,7 +1085,7 @@ def train(cfg: TrainConfig) -> str:
     # Main Episode Loop
     for episode_id in range(1, cfg.episodes + 1):
         buffer = RolloutBuffer()
-        rollout = collect_episode(env, agent, buffer, cfg, rng, greedy=False) # collect rollout
+        rollout = collect_episode(env, agent, buffer, cfg, greedy=False) # collect rollout
 
         if isinstance(rollout, RolloutBuffer):
             buffer = rollout
@@ -1268,12 +1100,13 @@ def train(cfg: TrainConfig) -> str:
         if not hasattr(buffer, "compute_returns_and_advantages"):
             raise AttributeError("RolloutBuffer must implement compute_returns_and_advantages(...).")
 
-        last_value = np.zeros(cfg.robots, dtype=np.float32)
+        last_value = 0.0
         if isinstance(rollout, dict) and not rollout.get("done", True):
             with torch.no_grad():
-                last_state_t = torch.from_numpy(rollout["last_state"]).float()
+                device = next(agent.parameters()).device
+                last_state_t = torch.from_numpy(rollout["last_state"]).float().to(device)
                 value_t = agent.get_value(last_state_t)
-            last_value.fill(float(value_t.item()))
+            last_value = float(value_t.item())
 
         # Compute Returns and Advantages
         buffer.compute_returns_and_advantages(
