@@ -440,28 +440,41 @@ class RolloutBuffer:
         self.log_probs.append(log_probs)
         self.values.append(values)
 
-    def compute_returns_and_advantages(self, last_value, gamma: float, gae_lambda: float):
+    def compute_returns_and_advantages(self, last_value, gamma: float, gae_lambda: float, use_gae: bool = True):
         # 将列表转换为 Tensor
         rewards = torch.tensor(np.array(self.rewards), dtype=torch.float32)  # [T, N]
         values = torch.tensor(np.array(self.values), dtype=torch.float32)  # [T, N]
         dones = torch.tensor(np.array(self.dones), dtype=torch.float32)  # [T, N]
+        last_value = torch.as_tensor(last_value, dtype=torch.float32)
+        if last_value.ndim == 0:
+            last_value = last_value.repeat(values.shape[1])
 
-        # 扩展 values 数组以包含 last_value (即 V_next)
-        # 结果维度: [T+1, N]
-        v_next_all = torch.cat([values[1:], last_value.unsqueeze(0)], dim=0)
+        if use_gae:
+            # 扩展 values 数组以包含 last_value (即 V_next)
+            # 结果维度: [T+1, N]
+            v_next_all = torch.cat([values[1:], last_value.unsqueeze(0)], dim=0)
 
-        self.advantages = torch.zeros_like(rewards)
-        last_gae = 0
+            self.advantages = torch.zeros_like(rewards)
+            last_gae = torch.zeros(values.shape[1], dtype=torch.float32)
 
-        # 倒序遍历计算 GAE
-        for t in reversed(range(len(rewards))):
-            # TD Error: delta = r + gamma * V_next * (1-done) - V_now
-            delta = rewards[t] + gamma * v_next_all[t] * (1.0 - dones[t]) - values[t]
-            # GAE: A_t = delta + gamma * lambda * (1-done) * A_{t+1}
-            self.advantages[t] = last_gae = delta + gamma * gae_lambda * (1.0 - dones[t]) * last_gae
+            # 倒序遍历计算 GAE
+            for t in reversed(range(len(rewards))):
+                # TD Error: delta = r + gamma * V_next * (1-done) - V_now
+                delta = rewards[t] + gamma * v_next_all[t] * (1.0 - dones[t]) - values[t]
+                # GAE: A_t = delta + gamma * lambda * (1-done) * A_{t+1}
+                last_gae = delta + gamma * gae_lambda * (1.0 - dones[t]) * last_gae
+                self.advantages[t] = last_gae
 
-        # Returns = Advantage + Value (作为 Critic 的更新目标)
-        self.returns = self.advantages + values
+            # Returns = Advantage + Value (作为 Critic 的更新目标)
+            self.returns = self.advantages + values
+        else:
+            returns = torch.zeros_like(rewards)
+            running_return = last_value
+            for t in reversed(range(len(rewards))):
+                running_return = rewards[t] + gamma * running_return * (1.0 - dones[t])
+                returns[t] = running_return
+            self.returns = returns
+            self.advantages = self.returns - values
 
     def get_training_batches(self, minibatch_size: int):
         """
@@ -496,16 +509,16 @@ class RolloutBuffer:
         for start in range(0, total_samples, minibatch_size):
             batch_idx = indices[start: start + minibatch_size]
 
-            # 把这一批数据打包成一个元组 (Tuple)
-            batch_data = (
-                obs_f[batch_idx],
-                states_f[batch_idx],
-                actions_f[batch_idx],
-                log_probs_f[batch_idx],
-                advantages_f[batch_idx],
-                returns_f[batch_idx],
-                masks_f[batch_idx]
-            )
+            # 把这一批数据打包成一个字典，和 ppo_update(...) 的读取方式一致
+            batch_data = {
+                "obs": obs_f[batch_idx],
+                "states": states_f[batch_idx],
+                "actions": actions_f[batch_idx],
+                "old_log_probs": log_probs_f[batch_idx],
+                "advantages": advantages_f[batch_idx],
+                "returns": returns_f[batch_idx],
+                "action_masks": masks_f[batch_idx],
+            }
 
             # 塞进大列表
             all_batches.append(batch_data)
@@ -513,8 +526,8 @@ class RolloutBuffer:
         # 4. 直接返回这个大列表
         return all_batches
 
-#调用示例：
-#obs, state, action, log_prob, adv, ret, mask = all_batches[0]
+# 调用示例：
+# obs = all_batches[0]["obs"]
 
 
 # ============================================================
@@ -767,17 +780,19 @@ def pretrain_actor_with_greedy(env: ConstructionSchedulingEnv, agent, episodes: 
 # - buffer fields and tensor shapes
 
 def collect_episode(env: ConstructionSchedulingEnv, agent: MAPPOAgent, buffer: RolloutBuffer, cfg: TrainConfig, rng: np.random.Generator, greedy: bool = False):
-    obs = env.reset() 
+    obs, state = env.reset()
     done = False
     total_reward = 0
     step_count = 0
+    episode_rewards = []
+    infos = []
 
     while not done and step_count < cfg.max_steps:
         # A. 获取动作掩码 (防止选到不可行的任务)
-        masks = env.get_action_masks() # [num_robots, action_dim]
+        masks = env.action_mask() # [num_robots, action_dim]
 
         # B. 构造全局状态
-        state = obs.flatten() # 形状: [num_robots * obs_dim]
+        # state = obs.flatten() # 原写法: [num_robots * obs_dim]，会和 critic 的 state_dim 不匹配
 
         # C. 将 numpy 转为 torch tensor
         obs_t = torch.from_numpy(obs).float()
@@ -792,23 +807,34 @@ def collect_episode(env: ConstructionSchedulingEnv, agent: MAPPOAgent, buffer: R
 
         # D. 环境执行
         actions_np = actions_t.cpu().numpy()
-        next_obs, rewards, done, info = env.step(actions_np)
+        next_obs, next_state, reward, done, info = env.step(actions_np)
         buffer.add(
             obs=obs,
-            states=state,
+            states=np.repeat(state[None, :], env.num_robots, axis=0),
             actions=actions_np,
-            rewards=rewards,
-            dones=np.array([done] * env.robots), # 记录每个机器人对应的结束标志
+            rewards=np.full(env.num_robots, reward, dtype=np.float32),
+            dones=np.full(env.num_robots, done, dtype=np.float32), # 记录每个机器人对应的结束标志
             action_masks=masks,
             log_probs=log_probs_t.cpu().numpy(),
-            values=value_t.cpu().numpy()
+            values=np.full(env.num_robots, float(value_t.item()), dtype=np.float32)
         )
 
         obs = next_obs
-        total_reward += np.mean(rewards)
+        state = next_state
+        total_reward += reward
+        episode_rewards.append(reward)
+        infos.append(info)
         step_count += 1
 
-    return total_reward, step_count
+    return {
+        "buffer": buffer,
+        "reward": total_reward,
+        "length": step_count,
+        "rewards": episode_rewards,
+        "infos": infos,
+        "last_state": state,
+        "done": done,
+    }
 
 
 # ============================================================
@@ -1065,7 +1091,8 @@ def train(cfg: TrainConfig) -> str:
 
     # Main Episode Loop
     for episode_id in range(1, cfg.episodes + 1):
-        rollout = collect_episode(env, agent, rng, greedy=False) # collect rollout
+        buffer = RolloutBuffer()
+        rollout = collect_episode(env, agent, buffer, cfg, rng, greedy=False) # collect rollout
 
         if isinstance(rollout, RolloutBuffer):
             buffer = rollout
@@ -1080,9 +1107,16 @@ def train(cfg: TrainConfig) -> str:
         if not hasattr(buffer, "compute_returns_and_advantages"):
             raise AttributeError("RolloutBuffer must implement compute_returns_and_advantages(...).")
 
+        last_value = np.zeros(cfg.robots, dtype=np.float32)
+        if isinstance(rollout, dict) and not rollout.get("done", True):
+            with torch.no_grad():
+                last_state_t = torch.from_numpy(rollout["last_state"]).float()
+                value_t = agent.get_value(last_state_t)
+            last_value.fill(float(value_t.item()))
+
         # Compute Returns and Advantages
         buffer.compute_returns_and_advantages(
-            last_value=0.0,
+            last_value=last_value,
             gamma=cfg.gamma,
             gae_lambda=cfg.gae_lambda,
             use_gae=cfg.use_gae,
