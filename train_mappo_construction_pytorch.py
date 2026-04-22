@@ -59,7 +59,7 @@ class TrainConfig:
     grid_cols: int = 10
     robots: int = 6
     heavy_ratio: float = 0.25
-    max_steps: int = 900
+    max_steps: int = 200
     travel_speed_cells_per_step: float = 3.0
     travel_reward_weight: float = 0.01
 
@@ -604,6 +604,24 @@ def policy_guided_safe_action(env: ConstructionSchedulingEnv, agent, observation
     return actions
 
 
+# raw-policy HELPER
+def raw_policy_action(env: ConstructionSchedulingEnv, agent, observations: np.ndarray, masks: np.ndarray) -> np.ndarray:
+    """Use the actor directly with greedy masked argmax, no safe decoder."""
+    if torch is None or not hasattr(agent, "actor") or not isinstance(getattr(agent, "actor"), nn.Module):
+        raise NotImplementedError("raw_policy_action(...) requires a PyTorch actor.")
+
+    device = next(agent.actor.parameters()).device
+    obs_t = torch.as_tensor(observations, dtype=torch.float32, device=device)
+    mask_t = torch.as_tensor(masks, dtype=torch.float32, device=device)
+
+    with torch.no_grad():
+        logits_t = agent.actor(obs_t)
+        masked_logits_t = logits_t.masked_fill(mask_t < 0.5, -1.0e9)
+        actions_t = torch.argmax(masked_logits_t, dim=-1)
+
+    return actions_t.cpu().numpy()
+
+
 def pretrain_actor_with_greedy(env: ConstructionSchedulingEnv, agent, episodes: int, cfg: TrainConfig | None = None) -> None:
     """Behavior cloning warm start.
 
@@ -907,12 +925,8 @@ def ppo_update(agent: MAPPOAgent, buffer: RolloutBuffer, cfg: TrainConfig) -> Di
 # SECTION J - EVALUATION
 # ============================================================
 
-def evaluate(env: ConstructionSchedulingEnv, agent, episodes: int, seed: int):
-    """Run evaluation episodes without updating the policy.
-
-    Evaluation uses policy_guided_safe_action(...) instead of direct sampling so
-    independent robot preferences are decoded into a more feasible joint action.
-    """
+# evaluate Greedy + Raw + Safe
+def evaluate_with_mode(env: ConstructionSchedulingEnv, agent, episodes: int, seed: int, mode: str):
     if episodes <= 0:
         return {
             "success_rate": 0.0,
@@ -921,8 +935,6 @@ def evaluate(env: ConstructionSchedulingEnv, agent, episodes: int, seed: int):
             "mean_completed": 0.0,
         }
 
-    # Build Evaluation Environment
-    # Use a separate env so evaluation does not disturb the training episode.
     eval_env = ConstructionSchedulingEnv(
         grid_shape=env.grid_shape,
         num_robots=env.num_robots,
@@ -948,54 +960,77 @@ def evaluate(env: ConstructionSchedulingEnv, agent, episodes: int, seed: int):
     lengths = []
     successes = []
     completed_counts = []
-    stats_totals = {
-        "dependency_violations": [],
-        "task_conflicts": [],
-        "resource_conflicts": [],
-        "invalid_completed": [],
-        "busy_action_violations": [],
-    }
 
-    # Evaluation Episode Loop
     for _ in range(episodes):
         obs, _ = eval_env.reset()
         done = False
         episode_reward = 0.0
         step_count = 0
         last_info = {}
-        episode_stats = {key: 0.0 for key in stats_totals}
 
         while not done and step_count < eval_env.max_steps:
             masks = eval_env.action_mask()
-            actions = policy_guided_safe_action(eval_env, agent, obs, masks)
-            obs, _, reward, done, info = eval_env.step(actions)
 
+            if mode == "greedy_baseline":
+                actions = greedy_baseline_action(eval_env)
+            elif mode == "raw_policy":
+                actions = raw_policy_action(eval_env, agent, obs, masks)
+            elif mode == "safe_decoder":
+                actions = policy_guided_safe_action(eval_env, agent, obs, masks)
+            else:
+                raise ValueError(f"Unknown eval mode: {mode}")
+
+            obs, _, reward, done, info = eval_env.step(actions)
             episode_reward += float(reward)
             step_count += 1
             last_info = info
-            for key in episode_stats:
-                episode_stats[key] += float(info.get("stats", {}).get(key, 0.0))
 
         rewards.append(episode_reward)
         lengths.append(float(step_count))
         successes.append(float(last_info.get("success", False)))
         completed_counts.append(float(last_info.get("completed", 0)))
-        for key, value in episode_stats.items():
-            stats_totals[key].append(value)
 
     if torch is not None and hasattr(agent, "train"):
         agent.train(was_training)
 
-    # Aggregate Evaluation Metrics
-    metrics = {
+    return {
         "success_rate": float(np.mean(successes)),
         "mean_reward": float(np.mean(rewards)),
         "mean_length": float(np.mean(lengths)),
         "mean_completed": float(np.mean(completed_counts)),
     }
-    for key, values in stats_totals.items():
-        metrics[f"mean_{key}"] = float(np.mean(values))
-    return metrics
+
+# Comparison printer
+def compare_three_policies(env: ConstructionSchedulingEnv, agent, episodes: int, seed: int):
+    greedy_metrics = evaluate_with_mode(env, agent, episodes, seed, mode="greedy_baseline")
+    raw_metrics = evaluate_with_mode(env, agent, episodes, seed, mode="raw_policy")
+    safe_metrics = evaluate_with_mode(env, agent, episodes, seed, mode="safe_decoder")
+
+    print("\n=== POLICY COMPARISON ===")
+    print(
+        f"A. Greedy baseline      | success {greedy_metrics['success_rate']:.3f} "
+        f"| reward {greedy_metrics['mean_reward']:.2f} "
+        f"| length {greedy_metrics['mean_length']:.1f} "
+        f"| completed {greedy_metrics['mean_completed']:.1f}"
+    )
+    print(
+        f"B. Raw learned policy   | success {raw_metrics['success_rate']:.3f} "
+        f"| reward {raw_metrics['mean_reward']:.2f} "
+        f"| length {raw_metrics['mean_length']:.1f} "
+        f"| completed {raw_metrics['mean_completed']:.1f}"
+    )
+    print(
+        f"C. Safe decoder policy  | success {safe_metrics['success_rate']:.3f} "
+        f"| reward {safe_metrics['mean_reward']:.2f} "
+        f"| length {safe_metrics['mean_length']:.1f} "
+        f"| completed {safe_metrics['mean_completed']:.1f}"
+    )
+
+    return {
+        "greedy_baseline": greedy_metrics,
+        "raw_policy": raw_metrics,
+        "safe_decoder": safe_metrics,
+    }
 
 
 # ============================================================
@@ -1154,17 +1189,14 @@ def train(cfg: TrainConfig) -> str:
 
         # Evaluate every interval
         if cfg.eval_interval > 0 and episode_id % cfg.eval_interval == 0:
-            try:
-                metrics = evaluate(env, agent, episodes=cfg.eval_episodes, seed=cfg.seed + episode_id)
-                print(
-                    f"eval @ {episode_id:04d} | "
-                    f"success {metrics.get('success_rate', float('nan')):.3f} | "
-                    f"reward {metrics.get('mean_reward', float('nan')):.2f} | "
-                    f"len {metrics.get('mean_length', float('nan')):.1f} | "
-                    f"completed {metrics.get('mean_completed', float('nan')):.1f}"
-                )
-            except NotImplementedError:
-                print("skip evaluation: evaluate(...) not implemented yet")
+            comparison = compare_three_policies(
+                env,
+                agent,
+                episodes=cfg.eval_episodes,
+                seed=cfg.seed + episode_id,
+            )
+
+    compare_three_policies(env, agent, episodes=cfg.eval_episodes, seed=cfg.seed + 9999)
 
     # Save Final Model
     final_path = os.path.join(cfg.save_dir, "final_" + cfg.model_name)
@@ -1189,7 +1221,7 @@ def main() -> None:
     parser.add_argument("--grid-rows", type=int, default=10)
     parser.add_argument("--grid-cols", type=int, default=10)
     parser.add_argument("--heavy-ratio", type=float, default=0.25)
-    parser.add_argument("--max-steps", type=int, default=900)
+    parser.add_argument("--max-steps", type=int, default=200)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--save-dir", type=str, default="construction_models")
     parser.add_argument("--plot-interval", type=int, default=10)
