@@ -436,16 +436,16 @@ class ConstructionSchedulingEnv:
 
         # 2. Grid
         normal_colors = {
-            "blocked": (238, 242, 246),    # light cool gray
-            "available": (206, 244, 216),  # bright mint
-            "progress": (115, 216, 139),   # fresh green
-            "done": (57, 157, 87),         # saturated green
+            "blocked": (238, 242, 246),
+            "available": (206, 244, 216),
+            "progress": (115, 216, 139),
+            "done": (57, 157, 87),
         }
         heavy_colors = {
-            "blocked": (246, 239, 236),    # warm light gray
-            "available": (232, 239, 255),  # pale sky blue
-            "progress": (136, 194, 244),   # bright blue
-            "done": (61, 126, 204),        # saturated blue
+            "blocked": (246, 239, 236),
+            "available": (232, 239, 255),
+            "progress": (136, 194, 244),
+            "done": (61, 126, 204),
         }
 
         for module in range(self.num_modules):
@@ -487,7 +487,6 @@ class ConstructionSchedulingEnv:
                 curr_y = int(base_y + offset_radius * np.sin(angle))
                 curr_x = int(base_x + offset_radius * np.cos(angle))
 
-                # 绘制机器人圆点
                 cv2.circle(image, (curr_x, curr_y), int(cell_size * 0.18), color, -1, cv2.LINE_AA)
                 cv2.circle(image, (curr_x, curr_y), int(cell_size * 0.18), (245, 245, 242), 1, cv2.LINE_AA)
                 cv2.putText(image, str(rid), (curr_x - 4, curr_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
