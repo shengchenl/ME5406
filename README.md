@@ -1,212 +1,194 @@
-# Multi-Robot Cooperative Construction Scheduling
+# Multi-Robot Construction Scheduling with MAPPO
 
-This folder adds a course-project implementation inspired by the original
-ME5406 single-agent path-planning example. Instead of physical navigation, the
-new task studies high-level multi-robot construction scheduling under random
-module dependencies, heavy-module cooperation, stochastic task durations,
-heterogeneous robot capabilities, spatial travel costs, and a shared
-crane/resource constraint.
+This project implements a robotically inspired reinforcement learning system for
+high-level multi-robot construction scheduling. A team of heterogeneous robots
+must complete a grid of construction modules under random dependency
+constraints, normal and heavy task types, travel time, stochastic task duration,
+and a shared crane resource.
 
-The default project scale is now a `10 x 10` construction grid with `100`
-modules and `6` cooperative robots. The grid size is configurable from the
-training script, so larger experiments such as `12 x 12` can also be created.
+The final version of the project uses the PyTorch implementation:
 
-## Problem Definition
+- `construction_scheduling_env.py`
+- `train_mappo_construction_pytorch.py`
+- `validate_construction_policy_pytorch.py`
 
-- The construction site is an `N x M` grid. The default setting is `10 x 10`.
-- Each cell is one construction module, indexed in row-major order.
-- Each module is located at the center of its grid cell.
-- Robots start from boundary points around the construction site. The default
-  six starts are the four corners plus the top and bottom middle boundary
-  points.
-- Robot travel uses Manhattan distance. Travel time is added to task duration,
-  and a small reward penalty is applied for longer travel.
-- When a robot completes a module, its position is updated to that module.
-- A module is completed only after its multi-step installation duration elapses.
-- A fresh random dependency DAG is sampled each episode. Edges are generated only
-  from lower-index modules to higher-index modules, so the graph is acyclic.
-- Some modules are heavy and require at least two robots to select the same module.
-- Robots are heterogeneous: each robot has different speed multipliers for
-  normal and heavy modules.
-- Normal modules do not require the crane, so multiple idle robots can start
-  different normal modules in the same timestep.
-- Heavy modules require the shared crane. The crane can dispatch at most one
-  heavy module and then enters a short cooldown.
-- The team receives a shared global reward.
 
-Reward terms:
+## Problem Setting
 
-- Normal module started: `+0.1`
-- Heavy module started cooperatively: `+0.2`
-- Normal module completed: `+1`
-- Heavy module completed cooperatively: `+3`
-- Full structure completed: `+20`
-- Dependency violation or selecting completed module: `-1`
-- Task/resource conflict: `-2`
-- Busy robot taking a non-wait action: `-1`
-- Time penalty per step: `-0.05`
-- Travel distance penalty: `-0.01 x total assigned travel distance`
+- The construction site is an `N x M` grid. The default setting is `10 x 10`,
+  giving 100 construction modules.
+- Each module is indexed in row-major order and has a grid-cell location.
+- Six robots start from boundary locations around the site.
+- A random dependency DAG is sampled each episode. A module can only be assigned
+  after its prerequisites are completed.
+- Modules can be normal or heavy.
+- Normal modules require one robot.
+- Heavy modules require two robots and use a shared crane resource.
+- Robots are heterogeneous and have different normal-task and heavy-task
+  capability multipliers.
+- Robot travel is modeled with Manhattan distance. Travel time is included in
+  task duration.
+- The team receives a shared construction reward, while the actor training also
+  uses per-robot shaped rewards to help credit assignment.
+
+The action space is high-level task selection:
+
+- `0 ... num_modules - 1`: assign the robot to a construction module.
+- `num_modules`: wait.
+
+This abstraction focuses the project on cooperative task allocation and
+construction scheduling rather than low-level motor control.
+
+## Method
+
+The learning method is a MAPPO-inspired centralized-training /
+decentralized-execution approach:
+
+- A shared PyTorch actor network scores actions for each robot.
+- A centralized critic estimates the value of the global construction state.
+- Action masks prevent invalid module selections where possible.
+- A greedy behavior-cloning warm start is used before PPO updates.
+- PPO-style clipped policy updates train the actor and critic from collected
+  rollouts.
+- A safety decoder can convert learned task preferences into feasible joint
+  actions during evaluation, reducing duplicate normal assignments and ensuring
+  heavy tasks receive the required robot pair.
+
+The final comparison reports four policies:
+
+- `Naive greedy`: simple dependency-aware task ordering.
+- `Greedy baseline`: hand-designed distance-, capability-, and resource-aware
+  scheduler.
+- `Raw learned policy`: direct greedy execution of the learned actor.
+- `MAPPO + Safety Decoder`: learned actor preferences with feasibility decoding.
 
 ## Main Files
 
 - `construction_scheduling_env.py`
-  - Gym-style construction scheduling environment.
-  - Provides `reset()`, `step(actions)`, `action_mask()`, `render_text()`, and
-    `render_rgb()`.
+  - Environment and visualization.
+  - Provides `reset()`, `step(actions)`, `action_mask()`, `get_observations()`,
+    `get_global_state()`, and `render_rgb()`.
 
-- `train_mappo_construction.py`
-  - Trains a MAPPO-inspired centralized-training/decentralized-execution agent.
-  - Uses a shared MLP actor for all robots and a centralized MLP critic.
-  - Implemented in NumPy so it can run without installing PyTorch or TensorFlow.
-  - Uses a policy-guided safety decoder during validation so independent robot
-    scores become a feasible joint action on the larger `10 x 10` task.
+- `train_mappo_construction_pytorch.py`
+  - Final PyTorch MAPPO-inspired training script.
+  - Defines the shared actor, centralized critic, rollout buffer, behavior
+    cloning, PPO update, training loop, and training-time policy comparison.
 
-- `validate_construction_policy.py`
-  - Loads a trained model.
-  - Runs validation episodes.
-  - Saves a learned-policy GIF and a greedy-baseline GIF.
+- `validate_construction_policy_pytorch.py`
+  - Final PyTorch validation script.
+  - Loads a trained `.pth` checkpoint, evaluates all policies, saves metrics,
+    and generates GIF visualizations.
 
-- `requirements.txt`
-  - Minimal Python package list for this project code.
+## Environment Setup
 
-## Quick Start
+The code was developed and tested on Ubuntu/Linux with a conda environment.
+Windows may work with the same dependencies installed, but Ubuntu/Linux is the
+recommended and tested platform.
 
-Create an environment with NumPy, Matplotlib, and ImageIO. The current code does
-not require TensorFlow or PyTorch.
+Create and activate an environment, then install dependencies:
 
 ```bash
+conda create -n me5406-mappo python=3.10 -y
+conda activate me5406-mappo
 pip install -r requirements.txt
 ```
 
-Train the default `10 x 10` model:
+If you already have the `me5406-mappo` environment, activate it before running
+training or validation:
 
 ```bash
-python3 train_mappo_construction.py \
-  --grid-rows 10 \
-  --grid-cols 10 \
-  --robots 6 \
-  --max-steps 900 \
-  --bc-episodes 500 \
-  --bc-epochs 30 \
-  --episodes 700 \
-  --travel-speed 3.0 \
-  --travel-reward-weight 0.01 \
+conda activate me5406-mappo
+```
+
+## Training
+
+Run the final PyTorch trainer:
+
+```bash
+python train_mappo_construction_pytorch.py \
+  --episodes 300 \
+  --bc-episodes 300 \
+  --bc-epochs 20 \
+  --eval-interval 50 \
+  --eval-episodes 10 \
+  --save-dir models_pytorch \
   --plot-interval 10 \
-  --plot-path results/training_curves.png \
-  --save-dir models
+  --plot-path results/pytorch_training_curves.png
 ```
 
-For a faster smoke test:
+For a quick smoke test:
 
 ```bash
-python3 train_mappo_construction.py \
-  --grid-rows 10 \
-  --grid-cols 10 \
-  --robots 6 \
-  --max-steps 900 \
-  --bc-episodes 10 \
+python train_mappo_construction_pytorch.py \
   --episodes 3 \
-  --travel-speed 3.0 \
-  --travel-reward-weight 0.01 \
+  --bc-episodes 5 \
+  --bc-epochs 1 \
+  --eval-interval 1 \
+  --eval-episodes 2 \
+  --save-dir models_pytorch_smoke \
   --plot-interval 1 \
-  --plot-path results/training_curves_smoke.png \
-  --save-dir models_smoke
+  --plot-path results/pytorch_training_curves_smoke.png
 ```
 
-During training, the script continuously writes the CSV log and refreshes the
-curve image:
+Training outputs:
 
-- `models/training_log.csv`
-- `results/training_curves.png`
+- `models_pytorch/construction_mappo_best_raw_eval.pth`
+- `models_pytorch/construction_mappo_final.pth`
+- `models_pytorch/training_log.csv`
+- `results/pytorch_training_curves.png`
 
-Validate a trained model and create GIFs:
+## Validation
+
+Validate the trained PyTorch model:
 
 ```bash
-python3 validate_construction_policy.py \
-  --model models/construction_mappo_numpy.npz \
-  --episodes 30 \
-  --gif results/validation_episode_completion_order.gif \
-  --baseline-gif results/greedy_baseline_completion_order.gif \
-  --dag-gif results/validation_episode_dag.gif \
-  --baseline-dag-gif results/greedy_baseline_dag.gif
+python validate_construction_policy_pytorch.py \
+  --model models_pytorch/construction_mappo_best_raw_eval.pth \
+  --episodes 20 \
+  --gif-dir results/pytorch_validation_final \
+  --gif-duration 0.65 \
+  --metrics-json results/pytorch_validation_final_metrics.json
 ```
 
-Outputs:
+Validation outputs:
 
-- `models/construction_mappo_numpy.npz`
-- `models/final_construction_mappo_numpy.npz`
-- `results/training_log.csv`
-- `results/training_curves.png`
-- `results/validation_episode_completion_order.gif`
-- `results/greedy_baseline_completion_order.gif`
-- `results/validation_episode_dag.gif`
-- `results/greedy_baseline_dag.gif`
+- `results/pytorch_validation_final/raw_policy.gif`
+- `results/pytorch_validation_final/safe_decoder.gif`
+- `results/pytorch_validation_final/greedy_baseline.gif`
+- `results/pytorch_validation_final/raw_policy_final.png`
+- `results/pytorch_validation_final/safe_decoder_final.png`
+- `results/pytorch_validation_final/greedy_baseline_final.png`
+- `results/pytorch_validation_final_metrics.json`
 
-Recent spatial-version validation result:
+The GIF visualization shows robot movement using Manhattan-style paths. Module
+colors distinguish normal versus heavy modules and whether each module is
+locked, ready, active, or completed.
 
-- Current `10 x 10` learned policy validation over 5 episodes:
-  - Success rate: `1.000`
-  - Mean completion length: `133.600`
-  - Mean reward: `171.442`
-  - Mean conflicts: `0.000`
-  - Mean violations: `0.000`
-- The action space is now `101` actions: `100` module choices plus `wait`.
+## Example Final Result
 
-## Baseline
+One final policy comparison on the `10 x 10` task produced:
 
-The validation script includes a conventional greedy online scheduler:
+| Method | Success | Reward | Length | Completed |
+| --- | ---: | ---: | ---: | ---: |
+| Naive greedy | 0.000 | -1121.54 | 900.0 | 18.4 |
+| Greedy baseline | 1.000 | 303.31 | 133.2 | 100.0 |
+| Raw learned policy | 1.000 | 250.23 | 146.5 | 100.0 |
+| MAPPO + Safety Decoder | 1.000 | 302.35 | 138.8 | 100.0 |
 
-- Busy robots wait. If the crane is available and a heavy module is available,
-  assign an idle robot pair using both heavy-task capability and travel distance.
-- Assign remaining idle robots to different available normal modules according
-  to a distance-aware capability cost. Normal modules can be started in parallel.
+These results show that the raw learned policy can complete the task, while the
+safety-decoded learned policy approaches the performance of the strong
+hand-designed greedy baseline.
 
-This baseline is useful for comparison because it has direct access to the
-hand-designed scheduling heuristic. The learned policy is expected to approach
-this online scheduler while using only neural-network action selection.
+## Notes for Submission
 
-## Suggested Report Description
+For the final project submission, include:
 
-The learning method can be described as a lightweight MAPPO-inspired CTDE method:
+- Source code.
+- A trained PyTorch checkpoint in `models_pytorch/`.
+- Validation GIF/video results.
+- `requirements.txt`.
+- This `README.md`.
+- The individual report PDF.
 
-- Decentralized scoring: each robot evaluates task preferences with the shared
-  actor using its own observation.
-- Parameter sharing: all robots use the same actor network.
-- Centralized training: the critic receives the full construction state and
-  estimates the team value.
-- For the larger 10 x 10 setting, a policy-guided safety decoder converts
-  independent robot task scores into a valid joint action. This prevents
-  duplicate normal-task assignment and ensures heavy modules receive two robots.
-- The robot observation includes its current normalized position and its
-  normalized distance to every module, allowing the shared actor to learn
-  spatially efficient assignment preferences.
-- Shared reward: all robots optimize the same construction objective.
-- A greedy behavior-cloning warm start is used before policy-gradient updates so
-  the team quickly learns feasible dependency-respecting construction behavior.
-- The environment is intentionally dynamic: random DAGs, stochastic delays,
-  busy robots, heterogeneous capabilities, spatial travel, and crane cooldown
-  make it more difficult than static topological scheduling.
-
-Because the implementation is NumPy-only, it is best described as an educational
-deep RL implementation with MLP function approximation, not a production MAPPO
-library.
-
-## Larger Grid Experiments
-
-The same code can generate larger construction sites by changing the CLI
-arguments:
-
-```bash
-python3 train_mappo_construction.py \
-  --grid-rows 12 \
-  --grid-cols 12 \
-  --robots 8 \
-  --max-steps 900 \
-  --bc-episodes 700 \
-  --bc-epochs 35 \
-  --episodes 900 \
-  --save-dir models_12x12
-```
-
-For the final report, the safest claim is that `10 x 10` is the main learned
-setting, while larger grids are scalability experiments.
+Do not include Python cache folders such as `__pycache__/` or temporary
+experiment folders that are not part of the final result.
