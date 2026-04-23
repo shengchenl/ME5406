@@ -126,20 +126,6 @@ Main training outputs:
 - `models_pytorch/training_log.csv`
 - `results/pytorch_training_curves.png`
 
-For a quick smoke test:
-
-```bash
-python train_mappo_construction_pytorch.py \
-  --episodes 3 \
-  --bc-episodes 5 \
-  --bc-epochs 1 \
-  --eval-interval 1 \
-  --eval-episodes 2 \
-  --save-dir models_pytorch_smoke \
-  --plot-interval 1 \
-  --plot-path results/pytorch_training_curves_smoke.png
-```
-
 ## Validation
 
 To evaluate the trained model and generate GIF visualizations:
