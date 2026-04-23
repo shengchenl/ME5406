@@ -1,10 +1,9 @@
-
 #  Multi-robot cooperative construction scheduling environment.
 # Final Optimized Version:
-# 1. High-contrast visualization with distinct robot colors.
-# 2. Movement arrows showing the path from previous to current step.
-# 3. Anti-overlap: Robots at the same grid offset automatically.
-# 4. UI: Step counter (Total Time) displayed at top-left.
+# 1. High-contrast visualization with distinct robot colors
+# 2. Movement arrows showing the path from previous to current step
+# 3. Anti-overlap: Robots at the same grid offset automatically
+# 4. UI: Step counter (Total Time) displayed at top-left
 
 from __future__ import annotations
 
@@ -167,13 +166,11 @@ class ConstructionSchedulingEnv:
                 mask[module] = 1.0
         return mask
     
+    # Urgency / criticality score for each module
     def module_urgency_scores(self) -> np.ndarray:
         """
-        Urgency / criticality score for each module.
-
-        Higher score means the module unlocks more future work.
-        We count how many downstream descendants depend on this module
-        (directly or indirectly), then normalize to [0, 1].
+        higher score means the module unlocks more future work
+        count how many downstream descendants depend on this module (directly or indirectly), then normalize to [0, 1]
         """
         scores = np.zeros(self.num_modules, dtype=np.float32)
 
