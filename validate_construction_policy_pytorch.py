@@ -7,10 +7,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from dataclasses import asdict
-from typing import Callable, Dict, List, Tuple
+from dataclasses import asdict, fields
+from typing import Dict, List, Tuple
 
 import imageio.v2 as imageio
+import cv2
 import numpy as np
 import torch
 
@@ -34,7 +35,13 @@ def _ensure_parent_dir(path: str) -> None:
 def load_checkpoint_config(model_path: str) -> TrainConfig:
     checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
     config_data = checkpoint.get("config", {})
-    return TrainConfig(**config_data)
+    valid_fields = {field.name for field in fields(TrainConfig)}
+    filtered_config = {
+        key: value
+        for key, value in config_data.items()
+        if key in valid_fields
+    }
+    return TrainConfig(**filtered_config)
 
 
 def build_agent_and_env(model_path: str) -> Tuple[ConstructionSchedulingEnv, MAPPOAgent, TrainConfig]:
@@ -191,6 +198,71 @@ def print_comparison(metrics: Dict[str, Dict]) -> None:
         )
 
 
+PANEL_LABELS = {
+    "naive_greedy": "Naive Greedy",
+    "greedy_baseline": "Greedy Baseline",
+    "raw_policy": "Raw Learned Policy",
+    "safe_decoder": "MAPPO + Safety Decoder",
+}
+
+
+def label_frame(frame: np.ndarray, label: str) -> np.ndarray:
+    labeled = frame.copy()
+    bar_height = 34
+    labeled[:bar_height, :, :] = np.array([245, 247, 248], dtype=np.uint8)
+    cv2.putText(
+        labeled,
+        label,
+        (12, 23),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.62,
+        (48, 52, 55),
+        2,
+        cv2.LINE_AA,
+    )
+    return labeled
+
+
+def resize_frame(frame: np.ndarray, scale: float) -> np.ndarray:
+    if abs(scale - 1.0) < 1.0e-6:
+        return frame
+    height, width = frame.shape[:2]
+    new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+    return cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
+
+
+def make_comparison_frame(frames_by_mode: Dict[str, List[np.ndarray]], index: int, scale: float) -> np.ndarray:
+    order = ["naive_greedy", "greedy_baseline", "raw_policy", "safe_decoder"]
+    panels = []
+    for mode in order:
+        frames = frames_by_mode[mode]
+        frame = frames[min(index, len(frames) - 1)]
+        frame = resize_frame(frame, scale)
+        panels.append(label_frame(frame, PANEL_LABELS[mode]))
+    top = np.concatenate([panels[0], panels[1]], axis=1)
+    bottom = np.concatenate([panels[2], panels[3]], axis=1)
+    return np.concatenate([top, bottom], axis=0)
+
+
+def save_comparison_gif(
+    frames_by_mode: Dict[str, List[np.ndarray]],
+    gif_dir: str,
+    gif_duration: float,
+    scale: float = 0.55,
+) -> Dict[str, str]:
+    frame_count = max(len(frames) for frames in frames_by_mode.values())
+    comparison_frames = [
+        make_comparison_frame(frames_by_mode, index, scale)
+        for index in range(frame_count)
+    ]
+    gif_path = os.path.join(gif_dir, "comparison_2x2.gif")
+    png_path = os.path.join(gif_dir, "comparison_2x2_final.png")
+    imageio.mimsave(gif_path, comparison_frames, duration=gif_duration)
+    imageio.imwrite(png_path, comparison_frames[-1])
+    print(f"saved 2x2 comparison gif: {gif_path}")
+    return {"gif": gif_path, "final_png": png_path}
+
+
 def save_demo_outputs(
     base_env: ConstructionSchedulingEnv,
     agent: MAPPOAgent,
@@ -198,13 +270,15 @@ def save_demo_outputs(
     gif_dir: str,
     gif_duration: float,
 ) -> Dict[str, Dict]:
-    modes = ["raw_policy", "safe_decoder", "greedy_baseline"]
+    modes = ["naive_greedy", "greedy_baseline", "raw_policy", "safe_decoder"]
     demo_summaries = {}
+    frames_by_mode: Dict[str, List[np.ndarray]] = {}
     os.makedirs(gif_dir, exist_ok=True)
 
     for mode in modes:
         env = make_env_like(base_env, seed)
         episode = run_episode(env, agent, mode, collect_frames=True)
+        frames_by_mode[mode] = episode["frames"]
         gif_path = os.path.join(gif_dir, f"{mode}.gif")
         png_path = os.path.join(gif_dir, f"{mode}_final.png")
         imageio.mimsave(gif_path, episode["frames"], duration=gif_duration)
@@ -218,12 +292,18 @@ def save_demo_outputs(
             f"| steps {summary['steps']} | reward {summary['reward']:.2f}"
         )
 
+    demo_summaries["comparison_2x2"] = save_comparison_gif(
+        frames_by_mode,
+        gif_dir=gif_dir,
+        gif_duration=gif_duration,
+    )
+
     return demo_summaries
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="construction_models/construction_mappo_best_raw_eval.pth")
+    parser.add_argument("--model", type=str, default="models_pytorch/construction_mappo_best_raw_eval.pth")
     parser.add_argument("--episodes", type=int, default=10)
     parser.add_argument("--seed", type=int, default=2024)
     parser.add_argument("--gif-dir", type=str, default="results/pytorch_validation")

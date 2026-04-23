@@ -141,12 +141,16 @@ python validate_construction_policy_pytorch.py \
 
 Validation outputs:
 
+- `results/pytorch_validation_final/naive_greedy.gif`
 - `results/pytorch_validation_final/raw_policy.gif`
 - `results/pytorch_validation_final/safe_decoder.gif`
 - `results/pytorch_validation_final/greedy_baseline.gif`
+- `results/pytorch_validation_final/comparison_2x2.gif`
+- `results/pytorch_validation_final/naive_greedy_final.png`
 - `results/pytorch_validation_final/raw_policy_final.png`
 - `results/pytorch_validation_final/safe_decoder_final.png`
 - `results/pytorch_validation_final/greedy_baseline_final.png`
+- `results/pytorch_validation_final/comparison_2x2_final.png`
 - `results/pytorch_validation_final_metrics.json`
 
 The visualization distinguishes normal and heavy modules, as well as locked,
@@ -159,6 +163,10 @@ The following GIF shows one successful validation rollout using the final
 `MAPPO + Safety Decoder` policy:
 
 ![MAPPO Safety Decoder Demo](results/pytorch_validation_final/safe_decoder.gif)
+
+The following 2x2 GIF compares all four evaluated policies:
+
+![Policy Comparison Demo](results/pytorch_validation_final/comparison_2x2.gif)
 
 ## Training Diagnostics
 

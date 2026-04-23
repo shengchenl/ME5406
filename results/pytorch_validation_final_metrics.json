@@ -1,5 +1,5 @@
 {
-    "model_path": "construction_models_torch_test/construction_mappo_best_raw_eval.pth",
+    "model_path": "models_pytorch/construction_mappo_best_raw_eval.pth",
     "config": {
         "grid_rows": 10,
         "grid_cols": 10,
@@ -9,17 +9,14 @@
         "travel_speed_cells_per_step": 3.0,
         "travel_reward_weight": 0.01,
         "seed": 7,
-        "episodes": 1,
-        "eval_interval": 1,
-        "eval_episodes": 1,
-        "save_dir": "construction_models_torch_test",
+        "episodes": 300,
+        "eval_interval": 50,
+        "eval_episodes": 10,
+        "save_dir": "models_pytorch",
         "model_name": "construction_mappo_best_raw_eval.pth",
         "plot_interval": 10,
-        "plot_path": "results/training_curves_torch_test.png",
+        "plot_path": "results/pytorch_training_curves.png",
         "resume_path": "",
-        "bc_episodes": 2,
-        "bc_epochs": 1,
-        "bc_batch_size": 256,
         "actor_hidden_sizes": [
             256,
             256
@@ -95,38 +92,38 @@
             "max_violations": 0.0
         },
         "raw_policy": {
-            "success_rate": 0.0,
-            "mean_steps": 900.0,
+            "success_rate": 1.0,
+            "mean_steps": 140.0,
             "std_steps": 0.0,
-            "min_steps": 900.0,
-            "max_steps": 900.0,
-            "mean_reward": -9.149993896484375,
+            "min_steps": 140.0,
+            "max_steps": 140.0,
+            "mean_reward": 256.6388854980469,
             "std_reward": 0.0,
-            "min_reward": -9.149993896484375,
-            "max_reward": -9.149993896484375,
-            "mean_completed": 61.0,
+            "min_reward": 256.6388854980469,
+            "max_reward": 256.6388854980469,
+            "mean_completed": 100.0,
             "std_completed": 0.0,
-            "min_completed": 61.0,
-            "max_completed": 61.0,
+            "min_completed": 100.0,
+            "max_completed": 100.0,
             "mean_conflicts": 0.0,
             "std_conflicts": 0.0,
             "min_conflicts": 0.0,
             "max_conflicts": 0.0,
-            "mean_violations": 26.0,
+            "mean_violations": 23.0,
             "std_violations": 0.0,
-            "min_violations": 26.0,
-            "max_violations": 26.0
+            "min_violations": 23.0,
+            "max_violations": 23.0
         },
         "safe_decoder": {
             "success_rate": 1.0,
-            "mean_steps": 139.0,
+            "mean_steps": 134.0,
             "std_steps": 0.0,
-            "min_steps": 139.0,
-            "max_steps": 139.0,
-            "mean_reward": 302.3111267089844,
+            "min_steps": 134.0,
+            "max_steps": 134.0,
+            "mean_reward": 303.1722412109375,
             "std_reward": 0.0,
-            "min_reward": 302.3111267089844,
-            "max_reward": 302.3111267089844,
+            "min_reward": 303.1722412109375,
+            "max_reward": 303.1722412109375,
             "mean_completed": 100.0,
             "std_completed": 0.0,
             "min_completed": 100.0,
@@ -142,27 +139,16 @@
         }
     },
     "demo_summaries": {
-        "raw_policy": {
+        "naive_greedy": {
             "success": false,
             "steps": 900,
-            "reward": -2.3499984741210938,
-            "completed": 78,
-            "total_modules": 100,
-            "conflicts": 0,
-            "violations": 49,
-            "gif": "results/pytorch_validation_arrive_then_work/raw_policy.gif",
-            "final_png": "results/pytorch_validation_arrive_then_work/raw_policy_final.png"
-        },
-        "safe_decoder": {
-            "success": true,
-            "steps": 138,
-            "reward": 302.48333740234375,
-            "completed": 100,
+            "reward": -1160.3502197265625,
+            "completed": 17,
             "total_modules": 100,
             "conflicts": 0,
             "violations": 0,
-            "gif": "results/pytorch_validation_arrive_then_work/safe_decoder.gif",
-            "final_png": "results/pytorch_validation_arrive_then_work/safe_decoder_final.png"
+            "gif": "results/pytorch_validation_final/naive_greedy.gif",
+            "final_png": "results/pytorch_validation_final/naive_greedy_final.png"
         },
         "greedy_baseline": {
             "success": true,
@@ -172,8 +158,34 @@
             "total_modules": 100,
             "conflicts": 0,
             "violations": 0,
-            "gif": "results/pytorch_validation_arrive_then_work/greedy_baseline.gif",
-            "final_png": "results/pytorch_validation_arrive_then_work/greedy_baseline_final.png"
+            "gif": "results/pytorch_validation_final/greedy_baseline.gif",
+            "final_png": "results/pytorch_validation_final/greedy_baseline_final.png"
+        },
+        "raw_policy": {
+            "success": true,
+            "steps": 136,
+            "reward": 258.42779541015625,
+            "completed": 100,
+            "total_modules": 100,
+            "conflicts": 0,
+            "violations": 24,
+            "gif": "results/pytorch_validation_final/raw_policy.gif",
+            "final_png": "results/pytorch_validation_final/raw_policy_final.png"
+        },
+        "safe_decoder": {
+            "success": true,
+            "steps": 140,
+            "reward": 302.1388854980469,
+            "completed": 100,
+            "total_modules": 100,
+            "conflicts": 0,
+            "violations": 0,
+            "gif": "results/pytorch_validation_final/safe_decoder.gif",
+            "final_png": "results/pytorch_validation_final/safe_decoder_final.png"
+        },
+        "comparison_2x2": {
+            "gif": "results/pytorch_validation_final/comparison_2x2.gif",
+            "final_png": "results/pytorch_validation_final/comparison_2x2_final.png"
         }
     }
 }
