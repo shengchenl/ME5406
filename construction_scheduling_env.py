@@ -68,7 +68,6 @@ class ConstructionSchedulingEnv:
         self.robot_start_positions = self._build_robot_start_positions()
         self.robot_positions = self.robot_start_positions.copy()
 
-        # 用于渲染箭头的历史位置记录
         self.last_robot_positions = self.robot_positions.copy()
         self.robot_task_start_positions = self.robot_positions.copy()
         self.robot_task_target_positions = self.robot_positions.copy()
