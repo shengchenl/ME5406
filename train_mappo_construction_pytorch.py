@@ -482,31 +482,90 @@ def greedy_baseline_action(env: ConstructionSchedulingEnv) -> np.ndarray:
 # Limited-knowledge naive baseline
 def naive_greedy_baseline_action(env: ConstructionSchedulingEnv) -> np.ndarray:
     """
-    Rules it uses:
-    - only assign dependency-available tasks
-    - assign tasks in simple module-order to idle robots
+    Uses:
+    - legal action mask
+    - dependency availability
+    - heavy-task indicator
+    - urgency scores
+    - own capability
+    - own distances
+    - simple sequential heavy pairing state
 
-    Rules it does not use:
-    - no heavy vs normal distinction
-    - no explicit 'heavy requires 2 robots' rule
-    - no heavy-first priority rule
-    - no travel-cost calculation
-    - no robot-capability scoring
-    - no matching / pairing optimization
+    Does NOT use:
+    - learned probabilities
+    - PPO / reward learning
+    - critic
+    - decoder search / matching optimization
     """
 
-    available = env.dependency_mask()
+    masks = env.action_mask()
+    distances = env.robot_module_distances()
+    urgency = env.module_urgency_scores()
     actions = np.ones(env.num_robots, dtype=np.int64) * env.wait_action
 
     idle = [int(r) for r in np.where(env.robot_remaining_time <= 0)[0]]
     if not idle:
         return actions
 
-    available_modules = [int(m) for m in np.where(available > 0.5)[0]]
+    # simple sequential coordination state, similar in spirit to actor context
+    selected_count = np.zeros(env.num_modules, dtype=np.float32)
+    heavy_pending = np.zeros(env.num_modules, dtype=np.float32)
 
-    # Treat all available modules the same, without knowing heavy-task structure
-    for rid, module in zip(idle, available_modules):
-        actions[rid] = module
+    for rid in idle:
+        legal_modules = [
+            m for m in range(env.num_modules)
+            if masks[rid, m] > 0.5
+        ]
+
+        if not legal_modules:
+            actions[rid] = env.wait_action
+            continue
+
+        best_module = env.wait_action
+        best_score = -1.0e9
+
+        for m in legal_modules:
+            score = 0.0
+
+            # prefer tasks that unlock more future work
+            score += 1.0 * float(urgency[m])
+
+            # prefer nearer tasks
+            score -= 1.0 * float(distances[rid, m]) / env.max_travel_distance
+
+            # capability-aware but simple
+            if env.heavy_mask[m] > 0.5:
+                score += 0.5
+                score += 0.5 * float(env.robot_capabilities[rid, 1])
+
+                # if one robot already selected this heavy module this timestep,
+                # encourage the second robot to join it
+                if heavy_pending[m] > 0.5:
+                    score += 1.0
+
+                # discourage over-selecting beyond pair formation
+                if selected_count[m] >= 2:
+                    score -= 10.0
+            else:
+                score += 0.3 * float(env.robot_capabilities[rid, 0])
+
+                # keep normal tasks unique
+                if selected_count[m] >= 1:
+                    score -= 10.0
+
+            if score > best_score:
+                best_score = score
+                best_module = int(m)
+
+        actions[rid] = best_module
+
+        if best_module != env.wait_action:
+            selected_count[best_module] += 1.0
+            if env.heavy_mask[best_module] > 0.5:
+                if selected_count[best_module] == 1:
+                    heavy_pending[best_module] = 1.0
+                else:
+                    heavy_pending[best_module] = 0.0
 
     return actions
 
