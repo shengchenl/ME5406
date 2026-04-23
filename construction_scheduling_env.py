@@ -71,15 +71,19 @@ class ConstructionSchedulingEnv:
 
         # 用于渲染箭头的历史位置记录
         self.last_robot_positions = self.robot_positions.copy()
+        self.robot_task_start_positions = self.robot_positions.copy()
+        self.robot_task_target_positions = self.robot_positions.copy()
+        self.robot_task_total_time = np.ones(self.num_robots, dtype=np.float32)
+        self.robot_task_travel_time = np.zeros(self.num_robots, dtype=np.float32)
 
-        # 高对比度机器人颜色 (BGR)
+        # Bright but soft robot colors (BGR).
         self.DISTINCT_ROBOT_COLORS = [
-            (0, 0, 255),      # 红色
-            (255, 0, 0),      # 蓝色
-            (0, 255, 0),      # 绿色
-            (0, 165, 255),    # 橙色
-            (204, 0, 204),    # 紫色
-            (0, 255, 255),    # 黄色
+            (242, 142, 43),   # blue
+            (91, 107, 230),   # coral
+            (102, 190, 92),   # green
+            (214, 156, 71),   # sky
+            (190, 100, 205),  # violet
+            (79, 188, 205),   # gold
         ]
 
         self.max_travel_distance = float(max(1.0, sum(self.grid_shape)))
@@ -204,6 +208,10 @@ class ConstructionSchedulingEnv:
         self.heavy_mask = self._sample_heavy_modules()
         self.robot_positions = self.robot_start_positions.copy()
         self.last_robot_positions = self.robot_positions.copy()
+        self.robot_task_start_positions = self.robot_positions.copy()
+        self.robot_task_target_positions = self.robot_positions.copy()
+        self.robot_task_total_time = np.ones(self.num_robots, dtype=np.float32)
+        self.robot_task_travel_time = np.zeros(self.num_robots, dtype=np.float32)
         self.module_owners = np.zeros((self.num_modules, self.num_robots), dtype=np.float32)
         self.robot_task = np.ones(self.num_robots, dtype=np.int64) * self.wait_action
         self.robot_remaining_time = np.zeros(self.num_robots, dtype=np.float32)
@@ -298,8 +306,49 @@ class ConstructionSchedulingEnv:
                 self.module_completion_order[module] = self.completion_event_count
         return reward
 
+    def _current_visual_robot_positions(self) -> np.ndarray:
+        visual_positions = self.robot_positions.copy()
+        busy = (self.robot_remaining_time > 0) & (self.robot_task != self.wait_action)
+        for rid in np.where(busy)[0]:
+            total_time = max(1.0, float(self.robot_task_total_time[rid]))
+            remaining = float(self.robot_remaining_time[rid])
+            elapsed = max(0.0, total_time - remaining)
+            travel_time = max(1.0, float(self.robot_task_travel_time[rid]))
+            progress = float(np.clip(elapsed / travel_time, 0.0, 1.0))
+            start = self.robot_task_start_positions[rid]
+            target = self.robot_task_target_positions[rid]
+            delta = target - start
+            row_distance = abs(float(delta[0]))
+            col_distance = abs(float(delta[1]))
+            manhattan_distance = row_distance + col_distance
+            if manhattan_distance <= 1.0e-6:
+                visual_positions[rid] = target
+                continue
+
+            traveled = progress * manhattan_distance
+            if traveled <= row_distance:
+                row_step = np.sign(delta[0]) * traveled
+                visual_positions[rid] = np.array([start[0] + row_step, start[1]], dtype=np.float32)
+            else:
+                col_traveled = traveled - row_distance
+                col_step = np.sign(delta[1]) * col_traveled
+                visual_positions[rid] = np.array([target[0], start[1] + col_step], dtype=np.float32)
+        return visual_positions
+
+    def _module_installation_started(self, module: int) -> bool:
+        owner_ids = np.where(self.module_owners[module] > 0.5)[0]
+        if len(owner_ids) == 0:
+            return False
+        for rid in owner_ids:
+            total_time = max(1.0, float(self.robot_task_total_time[rid]))
+            remaining = float(self.robot_remaining_time[rid])
+            elapsed = max(0.0, total_time - remaining)
+            if elapsed + 1.0e-6 < float(self.robot_task_travel_time[rid]):
+                return False
+        return True
+
     def step(self, actions: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float, bool, Dict]:
-        self.last_robot_positions = self.robot_positions.copy()
+        self.last_robot_positions = self._current_visual_robot_positions().copy()
         actions = np.asarray(actions, dtype=np.int64).reshape(self.num_robots)
         self.steps += 1
         stats = StepStats()
@@ -343,11 +392,16 @@ class ConstructionSchedulingEnv:
             heavy_candidates.sort(key=lambda x: x[0]); start_candidates.append(heavy_candidates[0])
 
         for module, robots, is_heavy in sorted(start_candidates, key=lambda x: x[0]):
+            travel_time = self._travel_time_for(module, robots)
             duration = self._duration_for(module, robots, is_heavy)
             stats.travel_distance += float(np.sum(self.robot_module_distances()[robots, module]))
             self.in_progress[module] = 1.0
             self.remaining_module_time[module] = float(duration)
             self.module_owners[module, robots] = 1.0
+            self.robot_task_start_positions[robots] = self.robot_positions[robots]
+            self.robot_task_target_positions[robots] = self.module_positions[module]
+            self.robot_task_total_time[robots] = float(duration)
+            self.robot_task_travel_time[robots] = float(travel_time)
             self.robot_task[robots] = module
             self.robot_remaining_time[robots] = float(duration)
             self.robot_status[robots] = 2.0 if is_heavy else 1.0
@@ -370,54 +424,72 @@ class ConstructionSchedulingEnv:
         rows, cols = self.grid_shape
         if cell_size is None:
             cell_size = 60
-        header, legend = 50, 110
-        image = np.ones((rows * cell_size + header, cols * cell_size + legend, 3), dtype=np.uint8) * 245
+        header, legend = 50, 170
+        image = np.ones((rows * cell_size + header, cols * cell_size + legend, 3), dtype=np.uint8)
+        image[:, :, :] = np.array([238, 241, 241], dtype=np.uint8)
+        available = self.dependency_mask()
 
         # 1. Draw Header and Time
-        image[:header, :, :] = np.array([236, 238, 242], dtype=np.uint8)
+        image[:header, :, :] = np.array([226, 230, 232], dtype=np.uint8)
         step_text = f"Step: {self.steps}"
-        cv2.putText(image, step_text, (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (40, 40, 40), 2, cv2.LINE_AA)
+        cv2.putText(image, step_text, (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (58, 63, 66), 2, cv2.LINE_AA)
 
         # 2. Grid
+        normal_colors = {
+            "blocked": (238, 242, 246),    # light cool gray
+            "available": (206, 244, 216),  # bright mint
+            "progress": (115, 216, 139),   # fresh green
+            "done": (57, 157, 87),         # saturated green
+        }
+        heavy_colors = {
+            "blocked": (246, 239, 236),    # warm light gray
+            "available": (232, 239, 255),  # pale sky blue
+            "progress": (136, 194, 244),   # bright blue
+            "done": (61, 126, 204),        # saturated blue
+        }
+
         for module in range(self.num_modules):
             r, c = divmod(module, cols)
             y0, x0 = header + r * cell_size, c * cell_size
             y1, x1 = y0 + cell_size, x0 + cell_size
+            is_heavy = self.heavy_mask[module] > 0.5
+            palette = heavy_colors if is_heavy else normal_colors
             if self.completed[module] > 0.5:
-                color = (205, 232, 207) if self.heavy_mask[module] < 0.5 else (188, 211, 238)
-            elif self.in_progress[module] > 0.5:
-                color = (220, 226, 151) if self.heavy_mask[module] < 0.5 else (232, 205, 143)
+                color = palette["done"]
+            elif self.in_progress[module] > 0.5 and self._module_installation_started(module):
+                color = palette["progress"]
+            elif available[module] > 0.5:
+                color = palette["available"]
             else:
-                color = (230, 230, 230) if self.heavy_mask[module] < 0.5 else (202, 142, 52)
+                color = palette["blocked"]
             cv2.rectangle(image, (x0, y0), (x1, y1), color, -1)
-            cv2.rectangle(image, (x0, y0), (x1, y1), (40, 40, 40), 1)
+            cv2.rectangle(image, (x0, y0), (x1, y1), (92, 96, 94), 1)
+
+            if is_heavy:
+                cv2.circle(image, (x0 + cell_size - 9, y0 + 9), 4, (101, 96, 88), -1, cv2.LINE_AA)
 
         # 3. Draw robots
+        visual_positions = self._current_visual_robot_positions()
         occupancy = {}
-        for rid, pos in enumerate(self.robot_positions):
+        for rid, pos in enumerate(visual_positions):
             grid_r, grid_c = int(np.clip(pos[0], 0, rows-1)), int(np.clip(pos[1], 0, cols-1))
             occupancy.setdefault((grid_r, grid_c), []).append(rid)
 
         for (gr, gc), rids in occupancy.items():
             num_here = len(rids)
-            base_y, base_x = header + gr * cell_size + cell_size // 2, gc * cell_size + cell_size // 2
             offset_radius = cell_size * 0.22 if num_here > 1 else 0
             for i, rid in enumerate(rids):
+                pos = visual_positions[rid]
+                base_y = int(header + np.clip(pos[0], 0.5, rows - 0.5) * cell_size)
+                base_x = int(np.clip(pos[1], 0.5, cols - 0.5) * cell_size)
                 color = self.DISTINCT_ROBOT_COLORS[rid % len(self.DISTINCT_ROBOT_COLORS)]
                 angle = (2 * np.pi * i) / num_here
                 curr_y = int(base_y + offset_radius * np.sin(angle))
                 curr_x = int(base_x + offset_radius * np.cos(angle))
 
-                # 绘制箭头
-                prev_pos = self.last_robot_positions[rid]
-                if tuple(prev_pos.astype(int)) != (gr, gc):
-                    prev_y = int(header + prev_pos[0] * cell_size + cell_size // 2)
-                    prev_x = int(prev_pos[1] * cell_size + cell_size // 2)
-                    cv2.arrowedLine(image, (prev_x, prev_y), (curr_x, curr_y), color, 2, tipLength=0.25)
-
                 # 绘制机器人圆点
                 cv2.circle(image, (curr_x, curr_y), int(cell_size * 0.18), color, -1, cv2.LINE_AA)
-                cv2.circle(image, (curr_x, curr_y), int(cell_size * 0.18), (255, 255, 255), 1, cv2.LINE_AA)
+                cv2.circle(image, (curr_x, curr_y), int(cell_size * 0.18), (245, 245, 242), 1, cv2.LINE_AA)
                 cv2.putText(image, str(rid), (curr_x - 4, curr_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
 
         # 4. Legend
@@ -427,7 +499,26 @@ class ConstructionSchedulingEnv:
             color = self.DISTINCT_ROBOT_COLORS[rid % len(self.DISTINCT_ROBOT_COLORS)]
             cv2.rectangle(image, (lx, y), (lx + 20, y + 15), color, -1)
             txt = "BUSY" if self.robot_remaining_time[rid] > 0 else "IDLE"
-            cv2.putText(image, f"R{rid}:{txt}", (lx + 25, y + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (40, 40, 40), 1)
+            cv2.putText(image, f"R{rid}:{txt}", (lx + 25, y + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (58, 63, 66), 1)
+
+        legend_y = header + 20 + self.num_robots * 28 + 12
+        cv2.putText(image, "State", (lx, legend_y), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (58, 63, 66), 1, cv2.LINE_AA)
+        legend_y += 18
+        state_labels = [
+            ("N locked", normal_colors["blocked"]),
+            ("N ready", normal_colors["available"]),
+            ("N active", normal_colors["progress"]),
+            ("N done", normal_colors["done"]),
+            ("H locked", heavy_colors["blocked"]),
+            ("H ready", heavy_colors["available"]),
+            ("H active", heavy_colors["progress"]),
+            ("H done", heavy_colors["done"]),
+        ]
+        for label, color in state_labels:
+            cv2.rectangle(image, (lx, legend_y), (lx + 18, legend_y + 12), color, -1)
+            cv2.rectangle(image, (lx, legend_y), (lx + 18, legend_y + 12), (120, 120, 116), 1)
+            cv2.putText(image, label, (lx + 24, legend_y + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (58, 63, 66), 1, cv2.LINE_AA)
+            legend_y += 18
 
         return image
 
