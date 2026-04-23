@@ -256,11 +256,9 @@ def save_comparison_gif(
         for index in range(frame_count)
     ]
     gif_path = os.path.join(gif_dir, "comparison_2x2.gif")
-    png_path = os.path.join(gif_dir, "comparison_2x2_final.png")
     imageio.mimsave(gif_path, comparison_frames, duration=gif_duration)
-    imageio.imwrite(png_path, comparison_frames[-1])
     print(f"saved 2x2 comparison gif: {gif_path}")
-    return {"gif": gif_path, "final_png": png_path}
+    return {"gif": gif_path}
 
 
 def save_demo_outputs(
@@ -280,12 +278,9 @@ def save_demo_outputs(
         episode = run_episode(env, agent, mode, collect_frames=True)
         frames_by_mode[mode] = episode["frames"]
         gif_path = os.path.join(gif_dir, f"{mode}.gif")
-        png_path = os.path.join(gif_dir, f"{mode}_final.png")
         imageio.mimsave(gif_path, episode["frames"], duration=gif_duration)
-        imageio.imwrite(png_path, episode["frames"][-1])
         summary = summarize_episode(episode)
         summary["gif"] = gif_path
-        summary["final_png"] = png_path
         demo_summaries[mode] = summary
         print(
             f"saved {mode}: {gif_path} | success {summary['success']} "
