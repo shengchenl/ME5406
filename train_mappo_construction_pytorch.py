@@ -1,23 +1,6 @@
-"""train_mappo_construction_template.py
+#Final PyTorch MAPPO trainer for multi-robot construction scheduling.
+# trains a shared-actor, centralized-critic MAPPO policy for the construction scheduling environment and saves the best evaluation checkpoint
 
-Fresh shared template for the team to build the full PyTorch MAPPO trainer.
-
-Purpose
--------
-This file keeps the parts from the current NumPy trainer that are still useful
-right now, while clearly separating:
-1) KEEP FOR NOW
-2) REFERENCE / LEGACY
-3) REPLACE LATER WITH FULL MAPPO
-4) TEAM TODO SECTIONS
-
-Important
----------
-- This is a WORK TEMPLATE, not the final trainer yet.
-- The current NumPy actor/critic update code is kept only as legacy reference.
-- The final goal is a PyTorch shared-actor / centralized-critic MAPPO trainer.
-- The environment / validation code can stay mostly unchanged for now.
-"""
 
 from __future__ import annotations
 
@@ -30,9 +13,6 @@ from itertools import product
 
 import numpy as np
 
-# ============================================================
-# OPTIONAL PYTORCH IMPORTS FOR THE FULL VERSION
-# ============================================================
 try:
     import torch
     import torch.nn as nn
@@ -47,13 +27,12 @@ except Exception:
 from construction_scheduling_env import ConstructionSchedulingEnv
 
 
-# ============================================================
-# SECTION C - TRAIN CONFIG
-# ============================================================
+# ===============
+# TRAIN CONFIG
+# ===============
 
 @dataclass
 class TrainConfig:
-    """Config for the future full MAPPO trainer."""
 
     # environment
     grid_rows: int = 10
@@ -74,11 +53,6 @@ class TrainConfig:
     plot_interval: int = 10
     plot_path: str = "results/training_curves.png"
     resume_path: str = ""
-
-    # behavior cloning
-    bc_episodes: int = 500
-    bc_epochs: int = 30
-    bc_batch_size: int = 256
 
     # network architecture
     actor_hidden_sizes: Tuple[int, int] = (256, 256)
@@ -103,15 +77,9 @@ class TrainConfig:
     use_torch: bool = True
 
 
-# ============================================================
-# SECTION E - FULL PYTORCH MODEL SIDE (PERSON 1)
-# ============================================================
-# TODO [PERSON 1]
-# 1. Build PyTorch actor MLP
-# 2. Build PyTorch critic MLP
-# 3. Add masked action selection
-# 4. Return actions, log_probs, entropy, values
-# 5. Add save/load for torch model
+# ==========================
+# FULL PYTORCH MODEL
+# ==========================
 
 def get_activation(name: str):
     if nn is None:
@@ -124,8 +92,8 @@ def get_activation(name: str):
     raise ValueError(f"Unsupported activation: {name}")
 
 
+# Robot MLP
 class ActorMLP(nn.Module if nn is not None else object):
-    """Full PyTorch actor network placeholder."""
 
     def __init__(self, obs_dim: int, action_dim: int, hidden_sizes: Tuple[int, ...], activation: str):
         if nn is None:
@@ -144,8 +112,8 @@ class ActorMLP(nn.Module if nn is not None else object):
         return self.net(obs)
 
 
+# Critic MLP
 class CriticMLP(nn.Module if nn is not None else object):
-    """Full PyTorch centralized critic placeholder."""
 
     def __init__(self, state_dim: int, hidden_sizes: Tuple[int, ...], activation: str):
         if nn is None:
@@ -164,15 +132,8 @@ class CriticMLP(nn.Module if nn is not None else object):
         return self.net(state).squeeze(-1)
 
 
+# Shared Actor + Centralized Critic MAPPO Wrapper
 class MAPPOAgent(nn.Module if nn is not None else object):
-    """Shared actor + centralized critic MAPPO wrapper.
-
-    Person 1 owns this model-side interface:
-    - actor: maps each robot observation to action logits
-    - critic: maps the global state to a team value estimate
-    - action helpers: apply action masks, sample/choose actions, and compute
-      log-probabilities needed later by PPO
-    """
 
     def __init__(self, obs_dim: int, state_dim: int, action_dim: int, cfg: TrainConfig):
         if nn is None:
@@ -184,27 +145,16 @@ class MAPPOAgent(nn.Module if nn is not None else object):
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=cfg.actor_lr)
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=cfg.critic_lr)
 
+    # Build a categorical distribution after removing illegal actions
     def _masked_action_distribution(self, obs, action_mask):
-        """Build a categorical distribution after removing illegal actions.
 
-        obs shape:
-            [N, obs_dim], where N can be num_robots or a flattened rollout batch.
-
-        action_mask shape:
-            [N, action_dim], with 1 for legal actions and 0 for illegal actions.
-        """
         logits = self.actor(obs)
         masked_logits = logits.masked_fill(action_mask < 0.5, -1.0e9)
         return Categorical(logits=masked_logits), masked_logits
 
+    # Select one action for each robot/row in obs
     def get_action_and_logprob(self, obs, action_mask, greedy: bool = False):
-        """Select one action for each robot/row in obs.
 
-        Returns:
-            actions: [N]
-            log_probs: [N], log probability of the selected actions
-            entropy: [N], policy entropy for exploration regularization
-        """
         dist, masked_logits = self._masked_action_distribution(obs, action_mask)
         if greedy:
             actions = torch.argmax(masked_logits, dim=-1)
@@ -214,12 +164,9 @@ class MAPPOAgent(nn.Module if nn is not None else object):
         entropy = dist.entropy()
         return actions, log_probs, entropy
 
+    # Evaluate already-chosen actions under the current actor
     def evaluate_actions(self, obs, action_mask, actions):
-        """Evaluate already-chosen actions under the current actor.
-
-        PPO needs this during updates: rollout stores old actions, and the
-        current actor recomputes their new log-probabilities for the ratio.
-        """
+ 
         dist, _ = self._masked_action_distribution(obs, action_mask)
         log_probs = dist.log_prob(actions)
         entropy = dist.entropy()
@@ -249,20 +196,11 @@ class MAPPOAgent(nn.Module if nn is not None else object):
         self.critic.load_state_dict(checkpoint["critic_state_dict"])
 
 
-# ============================================================
-# SECTION F - RETURNS / GAE / DATA SIDE (PERSON 2)
-# ============================================================
-
-
-# TODO [PERSON 2]
-# 1. Define rollout buffer fields
-# 2. Store obs / states / actions / rewards / dones / masks / log_probs / values
-# 3. Compute GAE
-# 4. Compute returns
-# 5. Flatten / batch / minibatch
+# ========================
+# RETURNS / GAE / DATA
+# ========================
 
 class RolloutBuffer:
-    """Full rollout buffer placeholder for MAPPO."""
 
     def __init__(self):
         self.clear()
@@ -359,10 +297,8 @@ class RolloutBuffer:
         self.critic_returns = returns
         self.critic_advantages = advantages
 
+    # 一次性处理所有数据，并以列表形式返回所有训练批次。
     def get_training_batches(self, minibatch_size: int):
-        """
-        一次性处理所有数据，并以列表形式返回所有训练批次。
-        """
 
         def flatten_actor_tensor(data_list, dtype=torch.float32):
             arr = np.array(data_list)          # [T, N, ...]
@@ -384,11 +320,11 @@ class RolloutBuffer:
         # 注意：优势标准化放在 ppo_update(...) 中按 cfg.normalize_advantages 控制，
         # 这里保持原始 advantages，不重复标准化。
 
-        # 2. 随机洗牌
+        # 随机洗牌
         total_samples = obs_f.size(0)
         indices = torch.randperm(total_samples)
 
-        # 3. 核心改变：创建一个列表，把切好的“肉”都装进去
+        # 核心改变：创建一个列表，把切好的“肉”都装进去
         all_batches = []
 
         for start in range(0, total_samples, minibatch_size):
@@ -416,12 +352,13 @@ class RolloutBuffer:
 # obs = all_batches[0]["obs"]
 
 
-# ============================================================
-# SECTION G - EVALUATION / BASELINE HELPERS WE CAN MOSTLY KEEP
-# ============================================================
+# ===============
+# EVALUATION
+# ===============
 
+# Save a compact training-curve figure
 def update_training_curve_plot(history_path: str, output_path: str) -> None:
-    """Save a compact training-curve figure that can be refreshed while training."""
+
     if not os.path.exists(history_path):
         return
 
@@ -497,12 +434,9 @@ def update_training_curve_plot(history_path: str, output_path: str) -> None:
     plt.close(fig)
 
 
+# Baseline Conventional Model
 def greedy_baseline_action(env: ConstructionSchedulingEnv) -> np.ndarray:
-    """Capability- and distance-aware online greedy scheduler.
 
-    STATUS:
-    - KEEP FOR NOW.
-    """
     available = env.dependency_mask()
     actions = np.ones(env.num_robots, dtype=np.int64) * env.wait_action
 
@@ -557,15 +491,14 @@ def greedy_baseline_action(env: ConstructionSchedulingEnv) -> np.ndarray:
     return actions
 
 
+# Limited-knowledge naive baseline
 def naive_greedy_baseline_action(env: ConstructionSchedulingEnv) -> np.ndarray:
     """
-    Limited-knowledge naive baseline.
-
     Rules it uses:
     - only assign dependency-available tasks
     - assign tasks in simple module-order to idle robots
 
-    Rules it does NOT use:
+    Rules it does not use:
     - no heavy vs normal distinction
     - no explicit 'heavy requires 2 robots' rule
     - no heavy-first priority rule
@@ -597,12 +530,7 @@ def policy_guided_safe_action(
     observations: np.ndarray,
     masks: np.ndarray,
 ) -> np.ndarray:
-    """
-    Sequential coordination-aware decoder:
-    - actor is queried robot-by-robot with augmented observations
-    - actor probabilities guide the joint decision
-    - feasibility / coordination heuristics still refine the final assignment
-    """
+
     if torch is None or not hasattr(agent, "actor") or not isinstance(getattr(agent, "actor"), nn.Module):
         raise NotImplementedError("policy_guided_safe_action(...) requires a PyTorch actor.")
 
@@ -711,7 +639,7 @@ def policy_guided_safe_action(
                 remaining_idle.remove(rid)
 
 
-    # Try trusting the actor's raw normal-task choices first.
+    # Try trusting the actor's raw normal-task choices first
     raw_normal_actions = {}
     raw_normal_valid = True
 
@@ -733,8 +661,7 @@ def policy_guided_safe_action(
 
 
     # -------- Better joint matching for normal tasks --------
-    # Instead of greedy pair picking, build top-k module options for each idle robot,
-    # then search over combinations and keep the best non-duplicate assignment.
+    # Instead of greedy pair picking, build top-k module options for each idle robot, then search over combinations and keep the best non-duplicate assignment
 
     if raw_normal_valid and raw_normal_actions:
         for rid, module in raw_normal_actions.items():
@@ -812,10 +739,7 @@ def raw_policy_action(
     observations: np.ndarray,
     masks: np.ndarray,
 ) -> np.ndarray:
-    """
-    Sequential greedy actor execution using the same coordination-aware
-    observation format as training.
-    """
+
     if torch is None or not hasattr(agent, "actor") or not isinstance(getattr(agent, "actor"), nn.Module):
         raise NotImplementedError("raw_policy_action(...) requires a PyTorch actor.")
 
@@ -854,98 +778,7 @@ def raw_policy_action(
 
     return actions_np
 
-
-def pretrain_actor_with_greedy(
-    env: ConstructionSchedulingEnv,
-    agent,
-    episodes: int,
-    cfg: TrainConfig | None = None,
-) -> None:
-    """
-    Behavior cloning using the same sequential coordination-aware actor input
-    that PPO will later use.
-    """
-    if episodes <= 0:
-        return
-    if torch is None or F is None:
-        raise RuntimeError("PyTorch is not available.")
-    if not hasattr(agent, "actor") or not isinstance(getattr(agent, "actor"), nn.Module):
-        raise NotImplementedError("Behavior cloning warm start requires the PyTorch MAPPOAgent.")
-
-    bc_epochs = cfg.bc_epochs if cfg is not None else 10
-    bc_batch_size = cfg.bc_batch_size if cfg is not None else 256
-    max_steps = cfg.max_steps if cfg is not None else env.max_steps
-    device = next(agent.actor.parameters()).device
-
-    obs_samples = []
-    mask_samples = []
-    action_samples = []
-
-    for _ in range(episodes):
-        obs, _ = env.reset()
-        done = False
-        step_count = 0
-
-        while not done and step_count < max_steps:
-            base_masks = env.action_mask()
-            expert_actions = greedy_baseline_action(env)
-
-            selected_count = np.zeros(env.num_modules, dtype=np.float32)
-            heavy_pending = np.zeros(env.num_modules, dtype=np.float32)
-
-            for rid in range(env.num_robots):
-                coord_context = build_coord_context(env, selected_count, heavy_pending, rid)
-                obs_r = np.concatenate([obs[rid], coord_context]).astype(np.float32)
-
-                mask_r = build_sequential_mask(
-                    env,
-                    base_masks[rid],
-                    selected_count,
-                    heavy_pending,
-                )
-
-                obs_samples.append(obs_r)
-                mask_samples.append(mask_r)
-                action_samples.append(int(expert_actions[rid]))
-
-                update_coord_state(env, int(expert_actions[rid]), selected_count, heavy_pending)
-
-            obs, _, _, done, _ = env.step(expert_actions)
-            step_count += 1
-
-    if not obs_samples:
-        return
-
-    obs_tensor = torch.as_tensor(np.asarray(obs_samples, dtype=np.float32), device=device)
-    mask_tensor = torch.as_tensor(np.asarray(mask_samples, dtype=np.float32), device=device)
-    action_tensor = torch.as_tensor(np.asarray(action_samples, dtype=np.int64), device=device)
-
-    total_samples = obs_tensor.shape[0]
-    for epoch in range(1, bc_epochs + 1):
-        indices = torch.randperm(total_samples, device=device)
-        losses = []
-
-        for start in range(0, total_samples, bc_batch_size):
-            batch_idx = indices[start:start + bc_batch_size]
-
-            logits = agent.actor(obs_tensor[batch_idx])
-            masked_logits = logits.masked_fill(mask_tensor[batch_idx] < 0.5, -1.0e9)
-            loss = F.cross_entropy(masked_logits, action_tensor[batch_idx])
-
-            agent.actor_opt.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                agent.actor.parameters(),
-                cfg.max_grad_norm if cfg is not None else 0.5,
-            )
-            agent.actor_opt.step()
-            losses.append(float(loss.item()))
-
-        print(
-            f"bc epoch {epoch:03d}/{bc_epochs:03d} | "
-            f"loss {float(np.mean(losses)):.4f} | samples {total_samples}"
-        )
-
+# Coordination context for sequential actor selection
 def build_coord_context(
     env,
     selected_count: np.ndarray,
@@ -953,8 +786,6 @@ def build_coord_context(
     robot_order: int,
 ) -> np.ndarray:
     """
-    Richer coordination context for sequential actor selection.
-
     Components:
     - available_now: which modules are dependency-available right now
     - heavy_mask: which modules are heavy
@@ -1015,26 +846,18 @@ def update_coord_state(env, action: int, selected_count: np.ndarray, heavy_pendi
             heavy_pending[action] = 0.0
 
 
-# ============================================================
-# SECTION H - ROLLOUT COLLECTION (PERSON 2 + PERSON 3)
-# ============================================================
-# TODO [PERSON 2 / PERSON 3]
-# Decide exact outputs:
-# - actor observation format
-# - critic global-state format
-# - action representation
-# - buffer fields and tensor shapes
+# =======================
+# ROLLOUT COLLECTION
+# =======================
 
+# Per-robot shaped reward used for actor learning
 def compute_actor_shaped_rewards(
     env: ConstructionSchedulingEnv,
     actions_np: np.ndarray,
     base_masks: np.ndarray,
     team_reward: float,
 ) -> np.ndarray:
-    """
-    Per-robot shaped reward used for actor learning.
-    Critic still uses shared team reward.
-    """
+
     rewards = np.full(env.num_robots, 0.15 * float(team_reward), dtype=np.float32)
 
     available = env.dependency_mask()
@@ -1195,17 +1018,9 @@ def collect_episode(
     }
 
 
-# ============================================================
-# SECTION I - PPO / MAPPO UPDATE SIDE (PERSON 3)
-# ============================================================
-# TODO [PERSON 3]
-# 1. PPO clipped objective
-# 2. Critic loss
-# 3. Entropy regularization
-# 4. Optimizer step
-# 5. Gradient clipping
-# 6. Multiple PPO epochs
-# 7. Minibatch updates
+# =======
+# MAPPO
+# =======
 
 #---------------------------- Standardize Model and Data into PyTorch and same Device ---------------------------
 # Check which device model is on
@@ -1245,14 +1060,6 @@ def _extract_eval_logprob_entropy(eval_out):
 
 # ----------------------------------- Actual PPO Learning -------------------------------------------------
 def ppo_update(agent: MAPPOAgent, buffer: RolloutBuffer, cfg: TrainConfig) -> Dict[str, float]:
-    """
-    PPO / MAPPO inner learning loop.
-
-    Assumes:
-    - buffer.get_training_batches(cfg.minibatch_size) yields dict minibatches
-    - agent.evaluate_actions(obs, action_masks, actions) -> (log_probs, entropy)
-    - agent.get_value(states) -> values
-    """
 
     # Initial Checks
     if torch is None:
@@ -1351,9 +1158,9 @@ def ppo_update(agent: MAPPOAgent, buffer: RolloutBuffer, cfg: TrainConfig) -> Di
         "ratio_mean": float(np.mean(ratio_means)),
     }
 
-# ============================================================
-# SECTION J - EVALUATION
-# ============================================================
+# =============
+# EVALUATION
+# =============
 
 # evaluate Greedy + Raw + Safe
 def evaluate_with_mode(env: ConstructionSchedulingEnv, agent, episodes: int, seed: int, mode: str):
@@ -1433,7 +1240,6 @@ def evaluate_with_mode(env: ConstructionSchedulingEnv, agent, episodes: int, see
     }
 
 # Comparison printer
-
 def compare_four_policies(env: ConstructionSchedulingEnv, agent, episodes: int, seed: int):
     naive_metrics = evaluate_with_mode(env, agent, episodes, seed, mode="naive_greedy")
     greedy_metrics = evaluate_with_mode(env, agent, episodes, seed, mode="greedy_baseline")
@@ -1474,9 +1280,9 @@ def compare_four_policies(env: ConstructionSchedulingEnv, agent, episodes: int, 
     }
 
 
-# ============================================================
-# SECTION K - FULL TRAINING LOOP (PERSON 3)
-# ============================================================
+# =====================
+# FULL TRAINING LOOP
+# =====================
 
 # CSV Header String
 def _build_history_header() -> str:
@@ -1506,16 +1312,6 @@ def _save_if_possible(agent, path: str, cfg: TrainConfig) -> None:
 
 # Training Loop
 def train(cfg: TrainConfig) -> str:
-    """
-    Person 3 training-loop integration.
-
-    Expected external dependencies:
-    - collect_episode(...) implemented by Person 2 / shared work
-    - RolloutBuffer.compute_returns_and_advantages(...)
-    - RolloutBuffer.get_training_batches(...)
-    - MAPPOAgent.evaluate_actions(...)
-    - MAPPOAgent.save(...)
-    """
 
     # Check PyTorch available
     if torch is None:
@@ -1548,11 +1344,6 @@ def train(cfg: TrainConfig) -> str:
     if cfg.resume_path:
         agent.load(cfg.resume_path)
         print(f"loaded checkpoint: {cfg.resume_path}")
-    elif cfg.bc_episodes > 0:
-        try:
-            pretrain_actor_with_greedy(env, agent, cfg.bc_episodes, cfg)
-        except NotImplementedError:
-            print("skip BC warm start: pretrain_actor_with_greedy(...) not implemented yet")
 
     # Create log file: logging progress every episode
     os.makedirs(cfg.save_dir, exist_ok=True)
@@ -1674,16 +1465,13 @@ def train(cfg: TrainConfig) -> str:
     return best_model_path
 
 
-# ============================================================
-# SECTION L - CLI
-# ============================================================
+# =============
+#  CLI
+# =============
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--episodes", type=int, default=700)
-    parser.add_argument("--bc-episodes", type=int, default=500)
-    parser.add_argument("--bc-epochs", type=int, default=30)
-    parser.add_argument("--bc-batch-size", type=int, default=256)
     parser.add_argument("--eval-interval", type=int, default=100)
     parser.add_argument("--eval-episodes", type=int, default=20)
     parser.add_argument("--robots", type=int, default=6)
@@ -1702,9 +1490,6 @@ def main() -> None:
 
     cfg = TrainConfig(
         episodes=args.episodes,
-        bc_episodes=args.bc_episodes,
-        bc_epochs=args.bc_epochs,
-        bc_batch_size=args.bc_batch_size,
         eval_interval=args.eval_interval,
         eval_episodes=args.eval_episodes,
         robots=args.robots,
