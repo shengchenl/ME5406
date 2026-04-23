@@ -1,9 +1,6 @@
-"""Validate a trained PyTorch MAPPO construction scheduling policy.
+# Validate a trained PyTorch MAPPO construction scheduling policy.
+# loads a .pth checkpoint, evaluates the learned policy and baselines on shared episode seeds, and saves GIFs for qualitative inspection
 
-This script is the PyTorch counterpart of validate_construction_policy.py.
-It loads a .pth checkpoint, evaluates the learned policy and baselines on
-shared episode seeds, and saves GIFs for qualitative inspection.
-"""
 
 from __future__ import annotations
 
@@ -226,7 +223,7 @@ def save_demo_outputs(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="construction_models_torch_test/construction_mappo_best_raw_eval.pth")
+    parser.add_argument("--model", type=str, default="construction_models/construction_mappo_best_raw_eval.pth")
     parser.add_argument("--episodes", type=int, default=10)
     parser.add_argument("--seed", type=int, default=2024)
     parser.add_argument("--gif-dir", type=str, default="results/pytorch_validation")
