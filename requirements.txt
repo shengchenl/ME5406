@@ -1,3 +1,5 @@
 numpy>=1.23
 matplotlib>=3.6
 imageio>=2.31
+opencv-python>=4.8
+torch>=2.0

@@ -1,0 +1,13 @@
+name: me5406-mappo
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - numpy>=1.23
+  - matplotlib>=3.6
+  - imageio>=2.31
+  - pip:
+      - opencv-python>=4.8
+      - torch>=2.0

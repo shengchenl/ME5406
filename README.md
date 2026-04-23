@@ -1,108 +1,111 @@
 # Multi-Robot Construction Scheduling with MAPPO
 
-This project implements a robotically inspired reinforcement learning system for
+This repository contains a PyTorch reinforcement learning project for
 high-level multi-robot construction scheduling. A team of heterogeneous robots
-must complete a grid of construction modules under random dependency
-constraints, normal and heavy task types, travel time, stochastic task duration,
-and a shared crane resource.
+must complete a `10 x 10` construction grid with module dependencies, normal
+and heavy module types, stochastic task durations, Manhattan travel time, and a
+shared crane resource.
 
-The final version of the project uses the PyTorch implementation:
-
-- `construction_scheduling_env.py`
-- `train_mappo_construction_pytorch.py`
-- `validate_construction_policy_pytorch.py`
-
-
-## Problem Setting
-
-- The construction site is an `N x M` grid. The default setting is `10 x 10`,
-  giving 100 construction modules.
-- Each module is indexed in row-major order and has a grid-cell location.
-- Six robots start from boundary locations around the site.
-- A random dependency DAG is sampled each episode. A module can only be assigned
-  after its prerequisites are completed.
-- Modules can be normal or heavy.
-- Normal modules require one robot.
-- Heavy modules require two robots and use a shared crane resource.
-- Robots are heterogeneous and have different normal-task and heavy-task
-  capability multipliers.
-- Robot travel is modeled with Manhattan distance. Travel time is included in
-  task duration.
-- The team receives a shared construction reward, while the actor training also
-  uses per-robot shaped rewards to help credit assignment.
-
-The action space is high-level task selection:
-
-- `0 ... num_modules - 1`: assign the robot to a construction module.
-- `num_modules`: wait.
-
-This abstraction focuses the project on cooperative task allocation and
-construction scheduling rather than low-level motor control.
-
-## Method
-
-The learning method is a MAPPO-inspired centralized-training /
-decentralized-execution approach:
-
-- A shared PyTorch actor network scores actions for each robot.
-- A centralized critic estimates the value of the global construction state.
-- Action masks prevent invalid module selections where possible.
-- A greedy behavior-cloning warm start is used before PPO updates.
-- PPO-style clipped policy updates train the actor and critic from collected
-  rollouts.
-- A safety decoder can convert learned task preferences into feasible joint
-  actions during evaluation, reducing duplicate normal assignments and ensuring
-  heavy tasks receive the required robot pair.
-
-The final comparison reports four policies:
-
-- `Naive greedy`: simple dependency-aware task ordering.
-- `Greedy baseline`: hand-designed distance-, capability-, and resource-aware
-  scheduler.
-- `Raw learned policy`: direct greedy execution of the learned actor.
-- `MAPPO + Safety Decoder`: learned actor preferences with feasibility decoding.
+The final method is a MAPPO-inspired centralized-training /
+decentralized-execution approach. A shared actor network scores module
+assignments for each robot, while a centralized critic estimates the value of
+the full construction state. A behavior-cloning warm start and a safety decoder
+are used to improve feasibility and coordination.
 
 ## Main Files
 
 - `construction_scheduling_env.py`
-  - Environment and visualization.
-  - Provides `reset()`, `step(actions)`, `action_mask()`, `get_observations()`,
-    `get_global_state()`, and `render_rgb()`.
+  - Defines the construction scheduling environment.
+  - Handles module dependencies, robot states, heavy-module cooperation, crane
+    constraints, rewards, action masks, and RGB visualization.
 
 - `train_mappo_construction_pytorch.py`
-  - Final PyTorch MAPPO-inspired training script.
-  - Defines the shared actor, centralized critic, rollout buffer, behavior
+  - Trains the PyTorch MAPPO-inspired agent.
+  - Includes the shared actor, centralized critic, rollout buffer, behavior
     cloning, PPO update, training loop, and training-time policy comparison.
 
 - `validate_construction_policy_pytorch.py`
-  - Final PyTorch validation script.
-  - Loads a trained `.pth` checkpoint, evaluates all policies, saves metrics,
-    and generates GIF visualizations.
+  - Loads a trained `.pth` model.
+  - Evaluates the learned policy against greedy baselines.
+  - Saves validation metrics and GIF visualizations.
+
+- `models_pytorch/`
+  - Contains the trained PyTorch checkpoints used for validation.
+
+- `results/`
+  - Contains training curves, validation metrics, and generated GIF results.
 
 ## Environment Setup
 
-The code was developed and tested on Ubuntu/Linux with a conda environment.
-Windows may work with the same dependencies installed, but Ubuntu/Linux is the
-recommended and tested platform.
+The code was developed and tested on Ubuntu/Linux using conda. Ubuntu/Linux is
+recommended for reproducing the results.
 
-Create and activate an environment, then install dependencies:
+Create the conda environment:
 
 ```bash
-conda create -n me5406-mappo python=3.10 -y
+conda env create -f environment.yml
 conda activate me5406-mappo
+```
+
+Alternatively, install the Python dependencies into an existing environment:
+
+```bash
 pip install -r requirements.txt
 ```
 
-If you already have the `me5406-mappo` environment, activate it before running
-training or validation:
+The main dependencies are PyTorch, NumPy, OpenCV, Matplotlib, and ImageIO.
 
-```bash
-conda activate me5406-mappo
-```
+## Problem Formulation
+
+The construction site is represented as a grid of modules. In the default
+setting, there are 100 modules and 6 robots.
+
+- Each episode samples a new dependency DAG.
+- A module can only be assigned after all prerequisites are completed.
+- Normal modules require one robot.
+- Heavy modules require two robots and use the shared crane resource.
+- Robots have heterogeneous capabilities for normal and heavy tasks.
+- Robot travel time is computed using Manhattan distance and included in task
+  duration.
+- The team objective is to complete all modules efficiently while avoiding
+  invalid assignments and resource conflicts.
+
+The action space is high-level task selection:
+
+- `0 ... num_modules - 1`: assign the robot to a module.
+- `num_modules`: wait.
+
+This abstraction focuses on cooperative task allocation and construction
+scheduling rather than low-level motor control.
+
+## Method
+
+The method follows a MAPPO-inspired design:
+
+- **Shared actor:** all robots use the same actor network to score actions from
+  robot-specific observations.
+- **Centralized critic:** the critic receives the global construction state and
+  predicts a team value.
+- **Action masking:** illegal actions are masked before sampling or greedy
+  selection.
+- **Behavior cloning:** the actor is warm-started using demonstrations from a
+  greedy construction scheduler.
+- **PPO update:** the policy is updated with a clipped PPO objective.
+- **Safety decoder:** during evaluation, learned action preferences can be
+  decoded into feasible joint actions that respect normal-task uniqueness,
+  heavy-task pairing, and crane availability.
+
+The validation script compares four policies:
+
+- `Naive greedy`: simple dependency-aware assignment.
+- `Greedy baseline`: distance-, capability-, and crane-aware hand-designed
+  scheduler.
+- `Raw learned policy`: direct greedy execution of the learned actor.
+- `MAPPO + Safety Decoder`: learned actor preferences with feasibility decoding.
 
 ## Training
 
-Run the final PyTorch trainer:
+To train the final PyTorch model:
 
 ```bash
 python train_mappo_construction_pytorch.py \
@@ -115,6 +118,13 @@ python train_mappo_construction_pytorch.py \
   --plot-interval 10 \
   --plot-path results/pytorch_training_curves.png
 ```
+
+Main training outputs:
+
+- `models_pytorch/construction_mappo_best_raw_eval.pth`
+- `models_pytorch/construction_mappo_final.pth`
+- `models_pytorch/training_log.csv`
+- `results/pytorch_training_curves.png`
 
 For a quick smoke test:
 
@@ -130,16 +140,9 @@ python train_mappo_construction_pytorch.py \
   --plot-path results/pytorch_training_curves_smoke.png
 ```
 
-Training outputs:
-
-- `models_pytorch/construction_mappo_best_raw_eval.pth`
-- `models_pytorch/construction_mappo_final.pth`
-- `models_pytorch/training_log.csv`
-- `results/pytorch_training_curves.png`
-
 ## Validation
 
-Validate the trained PyTorch model:
+To evaluate the trained model and generate GIF visualizations:
 
 ```bash
 python validate_construction_policy_pytorch.py \
@@ -160,13 +163,13 @@ Validation outputs:
 - `results/pytorch_validation_final/greedy_baseline_final.png`
 - `results/pytorch_validation_final_metrics.json`
 
-The GIF visualization shows robot movement using Manhattan-style paths. Module
-colors distinguish normal versus heavy modules and whether each module is
-locked, ready, active, or completed.
+The visualization distinguishes normal and heavy modules, as well as locked,
+ready, active, and completed module states. Robot motion is displayed with
+Manhattan-style movement.
 
-## Example Final Result
+## Example Result
 
-One final policy comparison on the `10 x 10` task produced:
+One final evaluation on the `10 x 10` construction task produced:
 
 | Method | Success | Reward | Length | Completed |
 | --- | ---: | ---: | ---: | ---: |
@@ -175,20 +178,6 @@ One final policy comparison on the `10 x 10` task produced:
 | Raw learned policy | 1.000 | 250.23 | 146.5 | 100.0 |
 | MAPPO + Safety Decoder | 1.000 | 302.35 | 138.8 | 100.0 |
 
-These results show that the raw learned policy can complete the task, while the
-safety-decoded learned policy approaches the performance of the strong
-hand-designed greedy baseline.
-
-## Notes for Submission
-
-For the final project submission, include:
-
-- Source code.
-- A trained PyTorch checkpoint in `models_pytorch/`.
-- Validation GIF/video results.
-- `requirements.txt`.
-- This `README.md`.
-- The individual report PDF.
-
-Do not include Python cache folders such as `__pycache__/` or temporary
-experiment folders that are not part of the final result.
+The raw learned policy successfully completes the randomized construction task.
+Adding the safety decoder improves efficiency and brings the learned approach
+close to the strong hand-designed greedy baseline.
