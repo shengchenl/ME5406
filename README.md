@@ -167,6 +167,20 @@ The visualization distinguishes normal and heavy modules, as well as locked,
 ready, active, and completed module states. Robot motion is displayed with
 Manhattan-style movement.
 
+## Demo
+
+The following GIF shows one successful validation rollout using the final
+`MAPPO + Safety Decoder` policy:
+
+![MAPPO Safety Decoder Demo](results/pytorch_validation_final/safe_decoder.gif)
+
+## Training Diagnostics
+
+The training log is saved to `models_pytorch/training_log.csv`. The generated
+training diagnostic plot is shown below:
+
+![Training Curves](results/pytorch_training_curves.png)
+
 ## Example Result
 
 One final evaluation on the `10 x 10` construction task produced:
