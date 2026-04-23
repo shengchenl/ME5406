@@ -9,8 +9,8 @@ shared crane resource.
 The final method is a MAPPO-inspired centralized-training /
 decentralized-execution approach. A shared actor network scores module
 assignments for each robot, while a centralized critic estimates the value of
-the full construction state. A behavior-cloning warm start and a safety decoder
-are used to improve feasibility and coordination.
+the full construction state. Action masking and a safety decoder are used to
+improve feasibility and coordination.
 
 ## Main Files
 
@@ -21,8 +21,8 @@ are used to improve feasibility and coordination.
 
 - `train_mappo_construction_pytorch.py`
   - Trains the PyTorch MAPPO-inspired agent.
-  - Includes the shared actor, centralized critic, rollout buffer, behavior
-    cloning, PPO update, training loop, and training-time policy comparison.
+  - Includes the shared actor, centralized critic, rollout buffer, PPO update,
+    training loop, and training-time policy comparison.
 
 - `validate_construction_policy_pytorch.py`
   - Loads a trained `.pth` model.
@@ -88,8 +88,6 @@ The method follows a MAPPO-inspired design:
   predicts a team value.
 - **Action masking:** illegal actions are masked before sampling or greedy
   selection.
-- **Behavior cloning:** the actor is warm-started using demonstrations from a
-  greedy construction scheduler.
 - **PPO update:** the policy is updated with a clipped PPO objective.
 - **Safety decoder:** during evaluation, learned action preferences can be
   decoded into feasible joint actions that respect normal-task uniqueness,
@@ -110,8 +108,6 @@ To train the final PyTorch model:
 ```bash
 python train_mappo_construction_pytorch.py \
   --episodes 300 \
-  --bc-episodes 300 \
-  --bc-epochs 20 \
   --eval-interval 50 \
   --eval-episodes 10 \
   --save-dir models_pytorch \
