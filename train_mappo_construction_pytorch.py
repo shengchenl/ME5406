@@ -248,7 +248,6 @@ class RolloutBuffer:
         self.critic_values.append(value) 
 
     def compute_returns_and_advantages(self, last_value, gamma: float, gae_lambda: float, use_gae: bool = True):
-        # 将列表转换为 Tensor
         critic_rewards = torch.tensor(np.array(self.critic_rewards), dtype=torch.float32)   # [T]
         critic_values = torch.tensor(np.array(self.critic_values), dtype=torch.float32)     # [T]
         critic_dones = torch.tensor(np.array(self.critic_dones), dtype=torch.float32)       # [T]
@@ -297,7 +296,6 @@ class RolloutBuffer:
         self.critic_returns = returns
         self.critic_advantages = advantages
 
-    # 一次性处理所有数据，并以列表形式返回所有训练批次。
     def get_training_batches(self, minibatch_size: int):
 
         def flatten_actor_tensor(data_list, dtype=torch.float32):
@@ -317,20 +315,15 @@ class RolloutBuffer:
         advantages_f = self.advantages.view(-1)
         returns_f = self.returns.view(-1)
         critic_returns = self.critic_returns.repeat_interleave(num_robots)
-        # 注意：优势标准化放在 ppo_update(...) 中按 cfg.normalize_advantages 控制，
-        # 这里保持原始 advantages，不重复标准化。
 
-        # 随机洗牌
         total_samples = obs_f.size(0)
         indices = torch.randperm(total_samples)
 
-        # 核心改变：创建一个列表，把切好的“肉”都装进去
         all_batches = []
 
         for start in range(0, total_samples, minibatch_size):
             batch_idx = indices[start: start + minibatch_size]
 
-            # 把这一批数据打包成一个字典，和 ppo_update(...) 的读取方式一致
             batch_data = {
                 "obs": obs_f[batch_idx],
                 "states": states_f[batch_idx],
@@ -342,14 +335,9 @@ class RolloutBuffer:
                 "action_masks": masks_f[batch_idx],
             }
 
-            # 塞进大列表
             all_batches.append(batch_data)
 
-        # 4. 直接返回这个大列表
         return all_batches
-
-# 调用示例：
-# obs = all_batches[0]["obs"]
 
 
 # ===============
