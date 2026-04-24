@@ -206,7 +206,13 @@ PANEL_LABELS = {
 }
 
 
-def label_frame(frame: np.ndarray, label: str) -> np.ndarray:
+def label_frame(
+    frame: np.ndarray,
+    label: str,
+    step_text: str | None = None,
+    finished: bool = False,
+    finished_text: str | None = None,
+) -> np.ndarray:
     labeled = frame.copy()
     bar_height = 34
     labeled[:bar_height, :, :] = np.array([245, 247, 248], dtype=np.uint8)
@@ -220,6 +226,37 @@ def label_frame(frame: np.ndarray, label: str) -> np.ndarray:
         2,
         cv2.LINE_AA,
     )
+    if step_text:
+        text_size = cv2.getTextSize(step_text, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 1)[0]
+        x = labeled.shape[1] - text_size[0] - 12
+        cv2.putText(
+            labeled,
+            step_text,
+            (x, 23),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.52,
+            (82, 88, 92),
+            1,
+            cv2.LINE_AA,
+        )
+    if finished:
+        h, w = labeled.shape[:2]
+        cv2.rectangle(labeled, (3, 3), (w - 4, h - 4), (94, 166, 110), 5)
+        text = finished_text or "Finished"
+        text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+        extra_chars_width = cv2.getTextSize("MMM", cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0][0]
+        tag_w = min(text_size[0] + extra_chars_width + 24, w - 24)
+        cv2.rectangle(labeled, (12, bar_height + 10), (12 + tag_w, bar_height + 46), (232, 245, 233), -1)
+        cv2.putText(
+            labeled,
+            text,
+            (22, bar_height + 34),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (56, 105, 64),
+            2,
+            cv2.LINE_AA,
+        )
     return labeled
 
 
@@ -231,14 +268,37 @@ def resize_frame(frame: np.ndarray, scale: float) -> np.ndarray:
     return cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
 
 
-def make_comparison_frame(frames_by_mode: Dict[str, List[np.ndarray]], index: int, scale: float) -> np.ndarray:
+def make_comparison_frame(
+    frames_by_mode: Dict[str, List[np.ndarray]],
+    summaries_by_mode: Dict[str, Dict],
+    index: int,
+    scale: float,
+) -> np.ndarray:
     order = ["naive_greedy", "greedy_baseline", "raw_policy", "safe_decoder"]
     panels = []
     for mode in order:
         frames = frames_by_mode[mode]
-        frame = frames[min(index, len(frames) - 1)]
+        last_index = len(frames) - 1
+        clamped_index = min(index, last_index)
+        frame = frames[clamped_index]
         frame = resize_frame(frame, scale)
-        panels.append(label_frame(frame, PANEL_LABELS[mode]))
+        finished = index >= last_index
+        finished_text = None
+        if finished:
+            summary = summaries_by_mode[mode]
+            if summary["success"]:
+                finished_text = f"Finished at step {summary['steps']}"
+            else:
+                finished_text = f"Stopped at step {summary['steps']}"
+        panels.append(
+            label_frame(
+                frame,
+                PANEL_LABELS[mode],
+                step_text=f"t = {clamped_index}",
+                finished=finished,
+                finished_text=finished_text,
+            )
+        )
     top = np.concatenate([panels[0], panels[1]], axis=1)
     bottom = np.concatenate([panels[2], panels[3]], axis=1)
     return np.concatenate([top, bottom], axis=0)
@@ -246,19 +306,71 @@ def make_comparison_frame(frames_by_mode: Dict[str, List[np.ndarray]], index: in
 
 def save_comparison_gif(
     frames_by_mode: Dict[str, List[np.ndarray]],
+    summaries_by_mode: Dict[str, Dict],
     gif_dir: str,
     gif_duration: float,
     scale: float = 0.55,
+    final_hold_frames: int = 8,
 ) -> Dict[str, str]:
     frame_count = max(len(frames) for frames in frames_by_mode.values())
     comparison_frames = [
-        make_comparison_frame(frames_by_mode, index, scale)
+        make_comparison_frame(frames_by_mode, summaries_by_mode, index, scale)
         for index in range(frame_count)
     ]
+    if comparison_frames:
+        comparison_frames.extend([comparison_frames[-1].copy() for _ in range(final_hold_frames)])
     gif_path = os.path.join(gif_dir, "comparison_2x2.gif")
     imageio.mimsave(gif_path, comparison_frames, duration=gif_duration)
     print(f"saved 2x2 comparison gif: {gif_path}")
-    return {"gif": gif_path}
+    return {"gif": gif_path, "frames": comparison_frames}
+
+
+def save_comparison_mp4(
+    comparison_frames: List[np.ndarray],
+    gif_dir: str,
+    fps: float,
+) -> str:
+    if not comparison_frames:
+        raise ValueError("comparison_frames must not be empty.")
+    mp4_path = os.path.join(gif_dir, "comparison_2x2.mp4")
+    height, width = comparison_frames[0].shape[:2]
+    writer = cv2.VideoWriter(
+        mp4_path,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps,
+        (width, height),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Failed to open video writer for {mp4_path}")
+    for frame in comparison_frames:
+        writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+    writer.release()
+    print(f"saved 2x2 comparison mp4: {mp4_path}")
+    return mp4_path
+
+
+def save_comparison_avi(
+    comparison_frames: List[np.ndarray],
+    gif_dir: str,
+    fps: float,
+) -> str:
+    if not comparison_frames:
+        raise ValueError("comparison_frames must not be empty.")
+    avi_path = os.path.join(gif_dir, "comparison_2x2.avi")
+    height, width = comparison_frames[0].shape[:2]
+    writer = cv2.VideoWriter(
+        avi_path,
+        cv2.VideoWriter_fourcc(*"MJPG"),
+        fps,
+        (width, height),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Failed to open video writer for {avi_path}")
+    for frame in comparison_frames:
+        writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+    writer.release()
+    print(f"saved 2x2 comparison avi: {avi_path}")
+    return avi_path
 
 
 def save_demo_outputs(
@@ -267,6 +379,7 @@ def save_demo_outputs(
     seed: int,
     gif_dir: str,
     gif_duration: float,
+    mp4_fps: float,
 ) -> Dict[str, Dict]:
     modes = ["naive_greedy", "greedy_baseline", "raw_policy", "safe_decoder"]
     demo_summaries = {}
@@ -287,11 +400,25 @@ def save_demo_outputs(
             f"| steps {summary['steps']} | reward {summary['reward']:.2f}"
         )
 
-    demo_summaries["comparison_2x2"] = save_comparison_gif(
+    comparison_outputs = save_comparison_gif(
         frames_by_mode,
+        demo_summaries,
         gif_dir=gif_dir,
         gif_duration=gif_duration,
     )
+    demo_summaries["comparison_2x2"] = {
+        "gif": comparison_outputs["gif"],
+        "mp4": save_comparison_mp4(
+            comparison_outputs["frames"],
+            gif_dir=gif_dir,
+            fps=mp4_fps,
+        ),
+        "avi": save_comparison_avi(
+            comparison_outputs["frames"],
+            gif_dir=gif_dir,
+            fps=mp4_fps,
+        ),
+    }
 
     return demo_summaries
 
@@ -303,6 +430,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=2024)
     parser.add_argument("--gif-dir", type=str, default="results/pytorch_validation")
     parser.add_argument("--gif-duration", type=float, default=0.55)
+    parser.add_argument("--mp4-fps", type=float, default=2.0)
     parser.add_argument("--metrics-json", type=str, default="results/pytorch_validation_metrics.json")
     args = parser.parse_args()
 
@@ -321,6 +449,7 @@ def main() -> None:
         seed=demo_seed,
         gif_dir=args.gif_dir,
         gif_duration=args.gif_duration,
+        mp4_fps=args.mp4_fps,
     )
 
     payload = {
